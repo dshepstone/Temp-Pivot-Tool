@@ -4,12 +4,22 @@
 global proc string tempPivotInstall_GetScriptDir()
 {
     string $info = `whatIs "tempPivotInstall_Run"`;
-    string $prefix = "Mel procedure found in: ";
-    if (`gmatch $info ($prefix + "*")`)
+    string $path = $info;
+    if (`gmatch $info "Mel procedure found in: *"`)
     {
-        $info = substituteAllString($info, $prefix, "");
+        $path = substituteAllString($info, "Mel procedure found in: ", "");
     }
-    return `dirname $info`;
+    else if (`gmatch $info "Script found in: *"`)
+    {
+        $path = substituteAllString($info, "Script found in: ", "");
+    }
+
+    $path = substituteAllString($path, "\\", "/");
+    if ($path == $info || $path == "")
+    {
+        error "Temp Pivot Tool installer: unable to locate installer directory.";
+    }
+    return `dirname $path`;
 }
 
 global proc tempPivotInstall_CopyFile(string $source, string $destinationDir)
@@ -43,18 +53,18 @@ global proc tempPivotInstall_CreateShelfButton(string $iconName)
         return;
     }
 
-    shelfButton -parent $currentShelf -label "Temp Pivot" -annotation "Temp Pivot Tool" -image $iconName -sourceType "python" -command "import importlib, temp_pivot_tool; importlib.reload(temp_pivot_tool); temp_pivot_tool.show()";
+    shelfButton -parent $currentShelf -label "Temp Pivot" -annotation "Temp Pivot Tool" -image $iconName -sourceType "python" -command "import temp_pivot_tool; temp_pivot_tool.show()";
 }
 
 global proc tempPivotInstall_Run()
 {
     global string $gShelfTopLevel;
     string $scriptDir = tempPivotInstall_GetScriptDir();
-    string $pythonSource = ($scriptDir + "/temp_pivot_tool.py");
-    string $iconSource = ($scriptDir + "/temp-pivot.png");
+    string $pythonSource = substituteAllString(($scriptDir + "/temp_pivot_tool.py"), "\\", "/");
+    string $iconSource = substituteAllString(($scriptDir + "/temp-pivot.png"), "\\", "/");
 
-    string $userScripts = `internalVar -userScriptDir`;
-    string $userIcons = `internalVar -userBitmapsDir`;
+    string $userScripts = substituteAllString(`internalVar -userScriptDir`, "\\", "/");
+    string $userIcons = substituteAllString(`internalVar -userBitmapsDir`, "\\", "/");
 
     tempPivotInstall_CopyFile($pythonSource, $userScripts);
     tempPivotInstall_CopyFile($iconSource, $userIcons);
