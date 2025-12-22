@@ -14,21 +14,23 @@ global proc string tempPivotInstall_GetScriptDir()
 
 global proc tempPivotInstall_CopyFile(string $source, string $destinationDir)
 {
+    string $cleanSource = substituteAllString($source, "\\", "/");
     string $targetDir = substituteAllString($destinationDir, "\\", "/");
     if (!`gmatch $targetDir "*/"`)
     {
         $targetDir += "/";
     }
-    if (!`filetest -f $source`)
+    if (!`filetest -f $cleanSource`)
     {
-        warning ("Temp Pivot Tool installer: missing file: " + $source);
+        warning ("Temp Pivot Tool installer: missing file: " + $cleanSource);
         return;
     }
     if (!`filetest -d $targetDir`)
     {
         sysFile -makeDir $targetDir;
     }
-    sysFile -copy -force $source $targetDir;
+    string $destination = ($targetDir + `basename $cleanSource ""`);
+    sysFile -copy -force $cleanSource $destination;
 }
 
 global proc tempPivotInstall_CreateShelfButton(string $iconName)
