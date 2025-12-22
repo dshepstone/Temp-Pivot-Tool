@@ -1,0 +1,66 @@
+// Temp Pivot Tool installer for Maya.
+// Drag and drop this file into Maya to install the tool and shelf button.
+
+global proc string tempPivotInstall_GetScriptDir()
+{
+    string $info = `whatIs "tempPivotInstall_Run"`;
+    string $prefix = "Mel procedure found in: ";
+    if (`gmatch $info ($prefix + "*")`)
+    {
+        $info = substituteAllString($info, $prefix, "");
+    }
+    return `dirname $info`;
+}
+
+global proc tempPivotInstall_CopyFile(string $source, string $destinationDir)
+{
+    string $destination = ($destinationDir + `basename $source`);
+    if (!`filetest -f $source`)
+    {
+        warning ("Temp Pivot Tool installer: missing file: " + $source);
+        return;
+    }
+    if (!`filetest -d $destinationDir`)
+    {
+        sysFile -makeDir $destinationDir;
+    }
+    sysFile -copy -force $source $destination;
+}
+
+global proc tempPivotInstall_CreateShelfButton(string $iconName)
+{
+    global string $gShelfTopLevel;
+    string $currentShelf = `tabLayout -q -selectTab $gShelfTopLevel`;
+    if ($currentShelf == "")
+    {
+        warning "Temp Pivot Tool installer: unable to locate current shelf.";
+        return;
+    }
+
+    shelfButton \
+        -parent $currentShelf \
+        -label "Temp Pivot" \
+        -annotation "Temp Pivot Tool" \
+        -image $iconName \
+        -sourceType "python" \
+        -command "import importlib, temp_pivot_tool; importlib.reload(temp_pivot_tool); temp_pivot_tool.show()";
+}
+
+global proc tempPivotInstall_Run()
+{
+    string $scriptDir = tempPivotInstall_GetScriptDir();
+    string $pythonSource = ($scriptDir + "/temp_pivot_tool.py");
+    string $iconSource = ($scriptDir + "/temp-pivot.png");
+
+    string $userScripts = `internalVar -userScriptDir`;
+    string $userIcons = `internalVar -userBitmapsDir`;
+
+    tempPivotInstall_CopyFile($pythonSource, $userScripts);
+    tempPivotInstall_CopyFile($iconSource, $userIcons);
+
+    tempPivotInstall_CreateShelfButton("temp-pivot.png");
+
+    print ("Temp Pivot Tool installed. Shelf button added to: " + `tabLayout -q -selectTab $gShelfTopLevel` + "\n");
+}
+
+tempPivotInstall_Run();
