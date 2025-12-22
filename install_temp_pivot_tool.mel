@@ -39,7 +39,12 @@ global proc tempPivot_DoCopy(string $source, string $destination)
         sysFile -makeDir $destDir;
     }
 
-    sysFile -copy -force $cleanSource $cleanDest;
+    // Use sysFile with proper quoting for paths with spaces
+    int $result = `sysFile -copy $cleanDest $cleanSource`;
+    if (!$result)
+    {
+        error ("Temp Pivot Tool installer: failed to copy file from " + $cleanSource + " to " + $cleanDest);
+    }
 }
 
 global proc tempPivotInstall_CreateShelfButton(string $iconName)
