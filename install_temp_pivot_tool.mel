@@ -3,8 +3,8 @@
 
 global proc string tempPivotInstall_GetScriptDir()
 {
-    string $info = `whatIs "tempPivotInstall_Run"`;
-    string $path = $info;
+    string $info = `whatIs "tempPivotInstall_GetScriptDir"`;
+    string $path = "";
     if (`gmatch $info "Mel procedure found in: *"`)
     {
         $path = substituteAllString($info, "Mel procedure found in: ", "");
@@ -15,37 +15,42 @@ global proc string tempPivotInstall_GetScriptDir()
     }
 
     $path = substituteAllString($path, "\\", "/");
-    if ($path == $info || $path == "")
+    if ($path == "")
     {
         error "Temp Pivot Tool installer: unable to locate installer directory.";
     }
     return `dirname $path`;
 }
 
-global proc tempPivotInstall_CopyFile(string $source, string $destinationDir)
+global proc tempPivot_DoCopy(string $source, string $destination)
 {
     string $cleanSource = substituteAllString($source, "\\", "/");
-    string $targetDir = substituteAllString($destinationDir, "\\", "/");
-    if (!`gmatch $targetDir "*/"`)
-    {
-        $targetDir += "/";
-    }
+    string $cleanDest = substituteAllString($destination, "\\", "/");
+
     if (!`filetest -f $cleanSource`)
     {
         warning ("Temp Pivot Tool installer: missing file: " + $cleanSource);
         return;
     }
-    if (!`filetest -d $targetDir`)
+
+    string $destDir = `dirname $cleanDest`;
+    if (!`filetest -d $destDir`)
     {
-        sysFile -makeDir $targetDir;
+        sysFile -makeDir $destDir;
     }
-    string $destination = ($targetDir + `basename $cleanSource ""`);
-    sysFile -copy -force $cleanSource $destination;
+
+    sysFile -copy -force $cleanSource $cleanDest;
 }
 
 global proc tempPivotInstall_CreateShelfButton(string $iconName)
 {
     global string $gShelfTopLevel;
+    if (!`tabLayout -exists $gShelfTopLevel`)
+    {
+        warning "Temp Pivot Tool installer: unable to locate shelf layout.";
+        return;
+    }
+
     string $currentShelf = `tabLayout -q -selectTab $gShelfTopLevel`;
     if ($currentShelf == "")
     {
@@ -53,25 +58,48 @@ global proc tempPivotInstall_CreateShelfButton(string $iconName)
         return;
     }
 
-    shelfButton -parent $currentShelf -label "Temp Pivot" -annotation "Temp Pivot Tool" -image $iconName -sourceType "python" -command "import temp_pivot_tool; temp_pivot_tool.show()";
+    shelfButton
+        -parent $currentShelf
+        -label "Temp Pivot"
+        -annotation "Temp Pivot Tool"
+        -image $iconName
+        -sourceType "python"
+        -command "import temp_pivot_tool; temp_pivot_tool.show()";
 }
 
-global proc tempPivotInstall_Run()
+global proc tempPivot_Install()
 {
     global string $gShelfTopLevel;
-    string $scriptDir = tempPivotInstall_GetScriptDir();
-    string $pythonSource = substituteAllString(($scriptDir + "/temp_pivot_tool.py"), "\\", "/");
-    string $iconSource = substituteAllString(($scriptDir + "/temp-pivot.png"), "\\", "/");
+    string $baseDir = tempPivotInstall_GetScriptDir();
+    $baseDir = substituteAllString($baseDir, "\\", "/");
+
+    string $pyFile = "temp_pivot_tool.py";
+    string $iconFile = "temp-pivot.png";
+
+    string $srcPy = ($baseDir + "/" + $pyFile);
+    string $srcIcon = ($baseDir + "/" + $iconFile);
 
     string $userScripts = substituteAllString(`internalVar -userScriptDir`, "\\", "/");
     string $userIcons = substituteAllString(`internalVar -userBitmapsDir`, "\\", "/");
 
-    tempPivotInstall_CopyFile($pythonSource, $userScripts);
-    tempPivotInstall_CopyFile($iconSource, $userIcons);
+    if (!`gmatch $userScripts "*/"`)
+    {
+        $userScripts += "/";
+    }
+    if (!`gmatch $userIcons "*/"`)
+    {
+        $userIcons += "/";
+    }
 
-    tempPivotInstall_CreateShelfButton("temp-pivot.png");
+    string $destPy = ($userScripts + $pyFile);
+    string $destIcon = ($userIcons + $iconFile);
+
+    tempPivot_DoCopy($srcPy, $destPy);
+    tempPivot_DoCopy($srcIcon, $destIcon);
+
+    tempPivotInstall_CreateShelfButton($iconFile);
 
     print ("Temp Pivot Tool installed. Shelf button added to: " + `tabLayout -q -selectTab $gShelfTopLevel` + "\n");
 }
 
-tempPivotInstall_Run();
+tempPivot_Install();
