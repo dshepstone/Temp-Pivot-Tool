@@ -328,8 +328,23 @@ def show() -> None:
     if cmds.window(WINDOW_NAME, exists=True):
         cmds.deleteUI(WINDOW_NAME)
 
-    cmds.window(WINDOW_NAME, title=WINDOW_TITLE, sizeable=False, widthHeight=(260, 220))
+    cmds.window(WINDOW_NAME, title=WINDOW_TITLE, sizeable=False, widthHeight=(320, 330))
     cmds.columnLayout(adjustableColumn=True, rowSpacing=6, columnAlign="center")
+
+    cmds.text(
+        label=(
+            "Usage:\n"
+            "1) Select one control and click SETUP.\n"
+            "2) Move the pivot locator to set the pivot.\n"
+            "3) Click TOGGLE ON to attach the temp pivot.\n"
+            "4) Use KEY CONTROL to commit keys.\n"
+            "5) Click TOGGLE OFF to detach cleanly.\n"
+            "6) DELETE removes the rig and settings."
+        ),
+        align="left",
+        wordWrap=True,
+        height=90,
+    )
 
     cmds.button(label="SETUP", height=28, command=lambda *_: setup_pivot_rig())
     cmds.button(label="TOGGLE ON", height=28, command=lambda *_: toggle_on())
