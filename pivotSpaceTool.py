@@ -353,7 +353,7 @@ def show() -> None:
     cmds.button(label="DELETE", height=28, command=lambda *_: delete_rig())
 
     cmds.separator(height=8, style="in")
-    cmds.text(name="pstStatusText", label="Control: None | Pivot: OFF | Constraint: Missing", align="center")
+    cmds.text("pstStatusText", label="Control: None | Pivot: OFF | Constraint: Missing", align="center")
 
     cmds.showWindow(WINDOW_NAME)
     _update_status_text()
