@@ -4,21 +4,32 @@
 //
 // Drag and drop this file into Maya to install the Temp Pivot Tool.
 //
-// Features:
-//   - Create temporary pivots for any selected control or object
-//   - Store pivot configurations in scene nodes for later recall
-//   - Toggle temp pivot on/off with visual feedback
-//   - Auto-key transforms when manipulating with temp pivot
-//   - Interactive pivot locator for visual positioning
-//   - Smart Euler filter support
-//   - Modern UI design
+// A non-destructive, reusable temporary pivot system where:
+//   - The rig is never rebuilt - only constraints are created/deleted
+//   - The null group acts as the anchor for realigning the entire system
+//   - Locator 2 defines the pivot point
+//   - Locator 1 is the constraint driver
+//
+// Hierarchy Structure:
+//   null_GRP (anchor - for realigning system)
+//     └ locator_2 (PIVOT - user positions this)
+//         └ locator_1 (DRIVER - constrains the object)
+//
+// Workflow:
+//   1. Select control, click Setup
+//   2. Move locator_2 to set pivot point
+//   3. Toggle ON - constraint created, control follows pivot
+//   4. Rotate locator_2 - control orbits around pivot
+//   5. Key control when satisfied
+//   6. Toggle OFF - constraint deleted, control stays in place
+//   7. Toggle ON again - rig realigns to control's new position
 //
 // Author: David Shepstone
 // License: MIT
-// Version: 2.0.0
+// Version: 4.1.0
 // ============================================================================
 
-global string $tempPivotToolVersion = "2.0.0";
+global string $tempPivotToolVersion = "4.1.0";
 
 // ----------------------------------------------------------------------------
 // Get the directory where this installer script is located
@@ -123,7 +134,7 @@ global proc tempPivotInstall_CreateShelfButton(string $iconName)
     shelfButton
         -parent $currentShelf
         -label "Temp Pivot"
-        -annotation "Temp Pivot Tool - Create temporary pivots for rotation/scaling"
+        -annotation "Temp Pivot Tool - Create temporary rotation pivots for animation"
         -image $iconName
         -image1 $iconName
         -sourceType "python"
@@ -143,8 +154,6 @@ global proc tempPivot_CleanOldInstall()
 
     if (`filetest -f $oldFile`)
     {
-        // Check if file is from an older version by checking file size or date
-        // For now, we'll just overwrite
         print ("  Updating existing installation...\n");
     }
 }
@@ -228,12 +237,20 @@ global proc tempPivot_Install()
     print "  - Click the 'Temp Pivot' button on your shelf\n";
     print "  - Or run: import temp_pivot_tool; temp_pivot_tool.show()\n";
     print "\n";
-    print "Features:\n";
-    print "  - Create temporary pivots for any object\n";
-    print "  - Store/recall pivot configurations\n";
-    print "  - Auto-key transforms when using temp pivot\n";
-    print "  - Interactive pivot locator\n";
-    print "  - Smart Euler filter support\n";
+    print "Workflow:\n";
+    print "  1. Select a control (e.g., IK foot)\n";
+    print "  2. Click 'Setup Pivot Rig'\n";
+    print "  3. Move locator_2 to desired pivot point\n";
+    print "  4. Click 'Toggle ON' to activate\n";
+    print "  5. Rotate locator_2 - control orbits around pivot\n";
+    print "  6. Click 'Key Control' to set keyframe\n";
+    print "  7. Click 'Toggle OFF' when done\n";
+    print "  8. Toggle ON again to realign and continue\n";
+    print "\n";
+    print "Hierarchy created:\n";
+    print "  null_GRP (realignment anchor)\n";
+    print "    + locator_2 (pivot point - move this)\n";
+    print "        + locator_1 (driver - constrains control)\n";
     print "\n";
 
     // Optionally launch the tool
