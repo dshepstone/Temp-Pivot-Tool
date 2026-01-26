@@ -70,19 +70,19 @@ UI_COLORS = {
 
 # Tooltips for UI elements
 TOOLTIPS = {
-    "apply_btn": "Create a new temp pivot for the selected object(s).\nThe pivot locator will appear at the selection center.",
-    "activate_btn": "Activate the temp pivot to control rotation.\nThe selected object will be constrained to rotate around the pivot.\nShortcut: Press Enter when pivot is selected.",
-    "deactivate_btn": "Release control and return to normal.\nThe object's rotation will be keyed and the constraint removed.\nPivot position is saved for future use.",
-    "toggle_btn": "Toggle the temp pivot on/off.\nWhen ON: Object rotates around the temp pivot.\nWhen OFF: Object uses its original pivot.",
+    "apply_btn": "Create a new temp pivot for the selected object(s).\nThe pivot locator will appear at the selection center.\nMove it to your desired rotation point before activating.",
+    "activate_btn": "Activate the temp pivot to control the object.\nThe object will ROTATE AROUND the pivot location.\nLike a door hinge - the pivot is the hinge point.\nShortcut: Press Enter when pivot is selected.",
+    "deactivate_btn": "Release control and bake the transform.\nThe object's position and rotation will be keyed.\nThe pivot position is saved for future use.",
+    "toggle_btn": "Toggle the temp pivot on/off.\nWhen ON: Object rotates AROUND the temp pivot point.\nWhen OFF: Object returns to normal control.",
     "reset_btn": "Reset the selected object to its original pivot.\nRemoves any active temp pivot control.",
-    "create_locator_btn": "Create a new pivot locator at the current selection.\nMove this locator to position your rotation pivot.",
+    "create_locator_btn": "Create a new pivot locator at the current selection.\nMove this locator to set where the rotation point will be.\nThen click Activate to start controlling the object.",
     "delete_locator_btn": "Delete the selected temp pivot locator.\nThis also removes any stored data for this pivot.",
     "move_pivot_btn": "Enter move mode to reposition the pivot.\nMove the locator, then click Activate to apply.",
-    "autokey_checkbox": "When enabled, automatically set keyframes on the\nobject when releasing temp pivot control.",
+    "autokey_checkbox": "When enabled, automatically set keyframes on the\nobject's translate and rotate when releasing control.",
     "euler_checkbox": "Apply Euler filter to rotation curves after keying.\nHelps prevent gimbal flipping between keyframes.",
     "affect_scale_checkbox": "Also affect the scale pivot when applying temp pivot.\nUseful when scaling from the same point as rotation.",
-    "stored_list": "List of all temp pivots created in this scene.\nDouble-click to select and activate a pivot.\nRight-click for more options.",
-    "recall_btn": "Recall and activate the selected stored pivot.\nThe pivot will be positioned at its saved location.",
+    "stored_list": "List of all temp pivots created in this scene.\nDouble-click to select the pivot locator.\n[ACTIVE] means the pivot is currently controlling an object.",
+    "recall_btn": "Move the pivot back to its saved position.\nUseful if the target object has moved and you want\nthe pivot to follow.",
     "delete_stored_btn": "Delete the selected stored pivot permanently.\nThis removes both the locator and saved data.",
     "refresh_btn": "Refresh the list of stored pivots.\nUse if pivots were created/deleted outside this tool.",
     "pivot_mode": "Choose where to initially place the pivot locator:\n- At Selection Center: Center of all selected objects\n- At Object Pivot: At the object's current pivot\n- At World Origin: At (0, 0, 0)\n- At Custom Position: Enter coordinates manually",
@@ -288,14 +288,20 @@ def create_pivot_locator(
 
 
 def delete_pivot_locator(locator_name: str) -> bool:
-    """Delete a pivot locator and clean up."""
+    """Delete a pivot locator and clean up all associated nodes."""
     if not cmds.objExists(locator_name):
         return False
 
-    # Deactivate first if active
+    # Deactivate first if active (this will clean up constraints and helper nodes)
     if cmds.attributeQuery("isActive", node=locator_name, exists=True):
         if cmds.getAttr(f"{locator_name}.isActive"):
-            deactivate_pivot(locator_name)
+            deactivate_pivot(locator_name, auto_key=False)
+
+    # Clean up any remaining helper nodes
+    for suffix in ["_pivotDriver", "_targetOffset", "_pivotGrp"]:
+        node = f"{locator_name}{suffix}"
+        if cmds.objExists(node):
+            cmds.delete(node)
 
     # Remove from stored data
     stored = _get_stored_pivots()
@@ -304,13 +310,14 @@ def delete_pivot_locator(locator_name: str) -> bool:
         _set_stored_pivots(stored)
 
     # Delete the locator
-    cmds.delete(locator_name)
+    if cmds.objExists(locator_name):
+        cmds.delete(locator_name)
 
     # Clean up empty group
-    grp = get_pivot_group()
-    children = cmds.listRelatives(grp, children=True) or []
-    if not children:
-        cmds.delete(grp)
+    if cmds.objExists(PIVOT_GROUP_NAME):
+        children = cmds.listRelatives(PIVOT_GROUP_NAME, children=True) or []
+        if not children:
+            cmds.delete(PIVOT_GROUP_NAME)
 
     return True
 
@@ -358,7 +365,10 @@ def _store_pivot_data(locator: str, target: str, position: Tuple[float, float, f
 def activate_pivot(locator: str) -> Tuple[bool, str]:
     """
     Activate the temp pivot to control the target object.
-    Creates a parent constraint to make the object rotate around the pivot.
+    Creates a parent constraint to make the object rotate AROUND the pivot point.
+
+    When you rotate the temp pivot locator, the target object will orbit around
+    the pivot location - like a planet orbiting the sun.
 
     Args:
         locator: The pivot locator to activate
@@ -378,42 +388,74 @@ def activate_pivot(locator: str) -> Tuple[bool, str]:
     if not target or not cmds.objExists(target):
         return False, f"Target object '{target}' not found."
 
-    # Check for locked attributes
-    for attr in ["rx", "ry", "rz"]:
+    # Check for locked translation attributes (needed for orbiting)
+    for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
         if cmds.getAttr(f"{target}.{attr}", lock=True):
             return False, f"Cannot activate: {target}.{attr} is locked."
-        if cmds.listConnections(f"{target}.{attr}", source=True, destination=False):
-            # Skip if already has connections (might be animated)
-            pass
 
-    # Create a temporary group at the locator position to use as pivot
-    pivot_grp = cmds.createNode("transform", name=f"{locator}_pivotGrp")
+    # Store original transform values BEFORE creating constraints
+    orig_translate = cmds.getAttr(f"{target}.translate")[0]
+    orig_rotate = cmds.getAttr(f"{target}.rotate")[0]
 
-    # Match locator position and rotation
+    # Add attributes to store original values if they don't exist
+    if not cmds.attributeQuery("origTranslate", node=locator, exists=True):
+        _add_double3_attr(locator, "origTranslate")
+    if not cmds.attributeQuery("origRotation", node=locator, exists=True):
+        _add_double3_attr(locator, "origRotation")
+
+    cmds.setAttr(f"{locator}.origTranslate", *orig_translate)
+    cmds.setAttr(f"{locator}.origRotation", *orig_rotate)
+
+    # Create a pivot driver group at the locator position
+    # This group will be the "pivot point" that the object rotates around
+    pivot_driver = cmds.createNode("transform", name=f"{locator}_pivotDriver")
+
+    # Match locator world position and rotation
     loc_pos = cmds.xform(locator, q=True, ws=True, t=True)
     loc_rot = cmds.xform(locator, q=True, ws=True, ro=True)
-    cmds.xform(pivot_grp, ws=True, t=loc_pos)
-    cmds.xform(pivot_grp, ws=True, ro=loc_rot)
+    cmds.xform(pivot_driver, ws=True, t=loc_pos)
+    cmds.xform(pivot_driver, ws=True, ro=loc_rot)
 
-    # Store original rotation values
-    orig_rot = cmds.getAttr(f"{target}.rotate")[0]
-    _add_double3_attr(locator, "origRotation") if not cmds.attributeQuery("origRotation", node=locator, exists=True) else None
-    if cmds.attributeQuery("origRotation", node=locator, exists=True):
-        cmds.setAttr(f"{locator}.origRotation", *orig_rot)
+    # Create a target offset group that maintains the target's position relative to pivot
+    # This is parented under the pivot driver so when pivot rotates, this orbits
+    target_offset = cmds.createNode("transform", name=f"{locator}_targetOffset")
 
-    # Create orient constraint from pivot group to target
-    # This makes the target follow the pivot's rotation
-    constraint = cmds.orientConstraint(
-        pivot_grp, target,
-        maintainOffset=True,
+    # Position the offset group at the target's current world position
+    target_pos = cmds.xform(target, q=True, ws=True, t=True)
+    target_rot = cmds.xform(target, q=True, ws=True, ro=True)
+    cmds.xform(target_offset, ws=True, t=target_pos)
+    cmds.xform(target_offset, ws=True, ro=target_rot)
+
+    # Parent the offset under the pivot driver
+    # Now when pivot_driver rotates, target_offset orbits around it
+    cmds.parent(target_offset, pivot_driver)
+
+    # Create parent constraint from target_offset to the actual target
+    # This makes the target follow the offset group (which orbits the pivot)
+    constraint = cmds.parentConstraint(
+        target_offset, target,
+        maintainOffset=False,  # We want exact following since offset is already positioned
         name=f"{target}{CONSTRAINT_SUFFIX}"
     )[0]
 
-    # Parent the pivot group under the locator so moving/rotating locator affects it
-    cmds.parent(pivot_grp, locator)
+    # Parent the pivot driver under the locator
+    # So when user rotates the locator, the whole system rotates
+    cmds.parent(pivot_driver, locator)
 
-    # Store constraint reference
+    # Store references
     cmds.setAttr(f"{locator}.constraintNode", constraint, type="string")
+
+    # Store additional node references
+    if not cmds.attributeQuery("pivotDriver", node=locator, exists=True):
+        _add_string_attr(locator, "pivotDriver", pivot_driver)
+    else:
+        cmds.setAttr(f"{locator}.pivotDriver", pivot_driver, type="string")
+
+    if not cmds.attributeQuery("targetOffset", node=locator, exists=True):
+        _add_string_attr(locator, "targetOffset", target_offset)
+    else:
+        cmds.setAttr(f"{locator}.targetOffset", target_offset, type="string")
+
     cmds.setAttr(f"{locator}.isActive", True)
 
     # Update stored data
@@ -422,7 +464,7 @@ def activate_pivot(locator: str) -> Tuple[bool, str]:
         stored[locator]["isActive"] = True
         _set_stored_pivots(stored)
 
-    # Change locator color to indicate active state
+    # Change locator color to indicate active state (green)
     shapes = cmds.listRelatives(locator, shapes=True) or []
     for shape in shapes:
         if cmds.nodeType(shape) == "locator":
@@ -430,13 +472,13 @@ def activate_pivot(locator: str) -> Tuple[bool, str]:
             cmds.setAttr(f"{shape}.overrideColorG", UI_COLORS["success"][1])
             cmds.setAttr(f"{shape}.overrideColorB", UI_COLORS["success"][2])
 
-    return True, f"Activated temp pivot for '{target}'. Rotate the pivot locator to control the object."
+    return True, f"Activated temp pivot for '{target}'. Rotate the pivot locator - the object will rotate around it."
 
 
 def deactivate_pivot(locator: str, auto_key: bool = True) -> Tuple[bool, str]:
     """
     Deactivate the temp pivot and return control to the object.
-    Optionally keys the object's current rotation.
+    Bakes the current world-space transform onto the target and optionally sets keyframes.
 
     Args:
         locator: The pivot locator to deactivate
@@ -454,38 +496,57 @@ def deactivate_pivot(locator: str, auto_key: bool = True) -> Tuple[bool, str]:
     target = cmds.getAttr(f"{locator}.targetObject")
     constraint_name = cmds.getAttr(f"{locator}.constraintNode")
 
-    # Get current rotation before removing constraint
-    current_rot = [0, 0, 0]
+    # Get current world-space transform BEFORE removing constraint
+    current_translate = [0, 0, 0]
+    current_rotate = [0, 0, 0]
     if target and cmds.objExists(target):
-        current_rot = cmds.getAttr(f"{target}.rotate")[0]
+        current_translate = cmds.xform(target, q=True, ws=True, t=True)
+        current_rotate = cmds.xform(target, q=True, ws=True, ro=True)
 
-    # Delete constraint
+    # Delete constraint first
     if constraint_name and cmds.objExists(constraint_name):
         cmds.delete(constraint_name)
 
-    # Delete pivot group
+    # Delete pivot driver and target offset groups
+    pivot_driver = f"{locator}_pivotDriver"
+    if cmds.objExists(pivot_driver):
+        cmds.delete(pivot_driver)
+
+    # Legacy cleanup (in case old pivot groups exist)
     pivot_grp = f"{locator}_pivotGrp"
     if cmds.objExists(pivot_grp):
         cmds.delete(pivot_grp)
 
-    # Apply rotation directly to target and optionally key
+    # Apply the world-space transform directly to target
     if target and cmds.objExists(target):
-        cmds.setAttr(f"{target}.rotate", *current_rot)
+        # Set the transform values
+        cmds.xform(target, ws=True, t=current_translate)
+        cmds.xform(target, ws=True, ro=current_rotate)
 
         if auto_key:
             manager = get_or_create_manager()
             if cmds.getAttr(f"{manager}.autoKeyEnabled"):
                 current_time = cmds.currentTime(query=True)
-                for attr in ["rx", "ry", "rz"]:
+
+                # Key both translation and rotation
+                for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
                     if not cmds.getAttr(f"{target}.{attr}", lock=True):
-                        cmds.setKeyframe(target, attribute=attr, time=current_time)
+                        try:
+                            cmds.setKeyframe(target, attribute=attr, time=current_time)
+                        except RuntimeError:
+                            pass  # Skip if attribute can't be keyed
 
                 # Apply euler filter if enabled
                 if cmds.getAttr(f"{manager}.smartEulerFilter"):
                     _apply_euler_filter(target)
 
-    # Update state
+    # Clear stored references
     cmds.setAttr(f"{locator}.constraintNode", "", type="string")
+    if cmds.attributeQuery("pivotDriver", node=locator, exists=True):
+        cmds.setAttr(f"{locator}.pivotDriver", "", type="string")
+    if cmds.attributeQuery("targetOffset", node=locator, exists=True):
+        cmds.setAttr(f"{locator}.targetOffset", "", type="string")
+
     cmds.setAttr(f"{locator}.isActive", False)
 
     # Update stored position (save current locator position as local offset)
@@ -497,7 +558,7 @@ def deactivate_pivot(locator: str, auto_key: bool = True) -> Tuple[bool, str]:
         stored[locator]["isActive"] = False
         _set_stored_pivots(stored)
 
-    # Reset locator color
+    # Reset locator color (back to orange)
     shapes = cmds.listRelatives(locator, shapes=True) or []
     for shape in shapes:
         if cmds.nodeType(shape) == "locator":
@@ -505,7 +566,7 @@ def deactivate_pivot(locator: str, auto_key: bool = True) -> Tuple[bool, str]:
             cmds.setAttr(f"{shape}.overrideColorG", UI_COLORS["active"][1])
             cmds.setAttr(f"{shape}.overrideColorB", UI_COLORS["active"][2])
 
-    keyed_msg = " Rotation keyed." if auto_key else ""
+    keyed_msg = " Transform keyed." if auto_key else ""
     return True, f"Deactivated temp pivot for '{target}'.{keyed_msg} Pivot position saved."
 
 
@@ -738,11 +799,12 @@ def show() -> None:
 
     # Description text
     cmds.text(
-        label="Select an object, create a pivot, position it, then activate.\n"
-              "The object will rotate around the temp pivot location.",
+        label="Select an object, create a pivot, move it to your desired\n"
+              "rotation point, then Activate. The object will orbit around\n"
+              "the pivot like a door rotating around its hinge.",
         align="left",
         wordWrap=True,
-        height=36,
+        height=44,
         font="smallPlainLabelFont"
     )
 
@@ -838,11 +900,12 @@ def show() -> None:
 
     cmds.text(
         label="Creates a pivot locator at the selected object.\n"
-              "Move the locator to position your rotation point.",
+              "Move the locator to where you want the rotation center.\n"
+              "Example: For a foot, place it at the ball or heel.",
         align="left",
         font="smallPlainLabelFont",
         wordWrap=True,
-        height=30
+        height=42
     )
 
     cmds.setParent("..")
@@ -866,10 +929,11 @@ def show() -> None:
     cmds.columnLayout(adjustableColumn=True, rowSpacing=4)
 
     cmds.text(
-        label="After positioning the pivot, activate it to control rotation:",
+        label="After positioning the pivot, activate it. Rotating the pivot\n"
+              "will make the object orbit around the pivot point:",
         align="left",
         font="smallPlainLabelFont",
-        height=20
+        height=30
     )
 
     # Activate/Deactivate row
