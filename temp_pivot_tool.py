@@ -22,11 +22,12 @@ Workflow:
 
 Features:
 - Auto-key: When you rotate locator_1, keyframes are automatically set on the control
-- Matrix-based alignment: Proper rotation alignment across all axes (X, Y, Z)
+- Constraint-based alignment: Proper world-space alignment regardless of local space or parent hierarchy
+- Constraint validation: Warns if control has existing constraints that could cause double transforms
 
 Author: David Shepstone
 License: MIT
-Version: 5.2.1
+Version: 5.3.0
 """
 
 from __future__ import annotations
@@ -121,53 +122,72 @@ def _sanitize_name(name: str) -> str:
     return safe
 
 
-def _get_world_xform(node: str) -> Tuple[List[float], List[float]]:
-    """Get world-space translate and rotate for a node."""
-    translate = cmds.xform(node, q=True, ws=True, t=True)
-    rotate = cmds.xform(node, q=True, ws=True, ro=True)
-    return translate, rotate
+def _get_world_position(node: str) -> List[float]:
+    """Get world-space position using rotatePivot for accuracy."""
+    # Use rotatePivot query which gives true world position
+    return cmds.xform(node, q=True, ws=True, rp=True)
 
 
-def _set_world_xform(node: str, translate: List[float], rotate: List[float]) -> None:
-    """Set world-space translate and rotate for a node."""
-    cmds.xform(node, ws=True, t=translate)
-    cmds.xform(node, ws=True, ro=rotate)
+def _match_transform_world(source: str, target: str, translate: bool = True, rotate: bool = True) -> None:
+    """
+    Match source to target's world-space transform using temporary constraint.
+
+    This is the most reliable method to match world-space transforms regardless
+    of rotation orders, gimbal lock, or parent hierarchies.
+    """
+    # Create a temporary parent constraint
+    temp_constraint = cmds.parentConstraint(
+        target, source,
+        maintainOffset=False,
+        skipTranslate=[] if translate else ["x", "y", "z"],
+        skipRotate=[] if rotate else ["x", "y", "z"]
+    )[0]
+    # Delete immediately - the source is now at target's world position/rotation
+    cmds.delete(temp_constraint)
 
 
-def _get_world_matrix(node: str) -> List[float]:
-    """Get the world matrix of a node as a flat list of 16 floats."""
-    return cmds.xform(node, q=True, ws=True, matrix=True)
+def _match_translation_world(source: str, target: str) -> None:
+    """Match only world-space translation using point constraint."""
+    temp_constraint = cmds.pointConstraint(target, source, maintainOffset=False)[0]
+    cmds.delete(temp_constraint)
 
 
-def _set_world_matrix(node: str, matrix: List[float]) -> None:
-    """Set the world matrix of a node from a flat list of 16 floats."""
-    cmds.xform(node, ws=True, matrix=matrix)
+def _match_rotation_world(source: str, target: str) -> None:
+    """Match only world-space rotation using orient constraint."""
+    temp_constraint = cmds.orientConstraint(target, source, maintainOffset=False)[0]
+    cmds.delete(temp_constraint)
 
 
-def _match_transform(source: str, target: str) -> None:
-    """Match source node's world transform to target node using matrix."""
-    # Use matrix-based matching which properly handles all rotation orders
-    matrix = _get_world_matrix(target)
-    _set_world_matrix(source, matrix)
+def _has_constraints(node: str) -> Tuple[bool, List[str]]:
+    """
+    Check if a node has any constraints affecting it.
 
+    Returns:
+        Tuple of (has_constraints, list_of_constraint_names)
+    """
+    constraint_types = [
+        "parentConstraint", "pointConstraint", "orientConstraint",
+        "scaleConstraint", "aimConstraint"
+    ]
 
-def _match_translation(source: str, target: str) -> None:
-    """Match only translation."""
-    translate, _ = _get_world_xform(target)
-    cmds.xform(source, ws=True, t=translate)
+    found_constraints = []
+    for ctype in constraint_types:
+        constraints = cmds.listRelatives(node, type=ctype) or []
+        found_constraints.extend(constraints)
 
+    # Also check connections to translate/rotate attributes
+    for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
+        attr_path = f"{node}.{attr}"
+        if cmds.objExists(attr_path):
+            connections = cmds.listConnections(attr_path, source=True, destination=False, plugs=True) or []
+            for conn in connections:
+                # Check if connection is from a constraint
+                conn_node = conn.split(".")[0]
+                node_type = cmds.nodeType(conn_node)
+                if "Constraint" in node_type and conn_node not in found_constraints:
+                    found_constraints.append(conn_node)
 
-def _match_rotation(source: str, target: str) -> None:
-    """Match only rotation using matrix decomposition for accuracy."""
-    # Get target's world matrix and extract rotation properly
-    # by applying just the rotation component to the source
-    target_matrix = _get_world_matrix(target)
-    source_translate = cmds.xform(source, q=True, ws=True, t=True)
-
-    # Build a new matrix with source's translation but target's rotation/scale
-    # Matrix layout: [r00,r01,r02,0, r10,r11,r12,0, r20,r21,r22,0, tx,ty,tz,1]
-    new_matrix = target_matrix[:12] + source_translate + [1.0]
-    _set_world_matrix(source, new_matrix)
+    return len(found_constraints) > 0, found_constraints
 
 
 def _add_string_attr(node: str, attr: str, value: str = "") -> None:
@@ -280,10 +300,10 @@ def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
     if not cmds.objExists(control):
         return False, f"Control '{control}' not found.", None
 
-    # Check if rig already exists
+    # Check if rig already exists for this control
     existing = get_rig_for_control(control)
     if existing:
-        return False, f"Pivot rig already exists for '{control}'.", None
+        return False, f"Pivot rig already exists for '{control}'. Delete it first or use Toggle.", None
 
     # Check if pending pivot exists
     pending = get_pending_pivot_for_control(control)
@@ -291,19 +311,25 @@ def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
         cmds.select(pending)
         return False, f"Pivot locator already created. Move it, then click 'Complete Setup'.", pending
 
+    # Check for existing constraints on the control (could cause double offset)
+    has_constraints, constraint_list = _has_constraints(control)
+    if has_constraints:
+        constraint_names = ", ".join(constraint_list[:3])  # Show first 3
+        if len(constraint_list) > 3:
+            constraint_names += f"... (+{len(constraint_list) - 3} more)"
+        return False, f"Control '{control}' has existing constraints: {constraint_names}. This may cause double transforms.", None
+
     # Create safe prefix
     prefix = _sanitize_name(control)
-
-    # Get control's world transform
-    ctrl_translate, ctrl_rotate = _get_world_xform(control)
 
     # =========================================================================
     # Create locator_1 (the PIVOT - user will position this)
     # =========================================================================
     locator_1 = cmds.spaceLocator(name=f"{prefix}{LOCATOR_1_SUFFIX}")[0]
 
-    # Match to control position initially
-    _set_world_xform(locator_1, ctrl_translate, ctrl_rotate)
+    # Match to control's world position and rotation using constraint method
+    # This ensures proper world-space alignment regardless of control's local space
+    _match_transform_world(locator_1, control)
 
     # Style locator_1 (orange - indicates pivot point)
     loc1_shape = cmds.listRelatives(locator_1, shapes=True)[0]
@@ -396,16 +422,13 @@ def complete_setup(locator_1: str) -> Tuple[bool, str, Optional[str]]:
 
     prefix = _sanitize_name(control)
 
-    # Get control's current world transform
-    ctrl_translate, ctrl_rotate = _get_world_xform(control)
-
     # =========================================================================
     # Create locator_2 (the DRIVER) at control position
     # =========================================================================
     locator_2 = cmds.spaceLocator(name=f"{prefix}{LOCATOR_2_SUFFIX}")[0]
 
-    # Match to control position
-    _set_world_xform(locator_2, ctrl_translate, ctrl_rotate)
+    # Match to control's world position using constraint method
+    _match_transform_world(locator_2, control)
 
     # Style locator_2 (green - indicates driver)
     loc2_shape = cmds.listRelatives(locator_2, shapes=True)[0]
@@ -430,8 +453,9 @@ def complete_setup(locator_1: str) -> Tuple[bool, str, Optional[str]]:
 
     # =========================================================================
     # Match null_GRP to locator_2 (which is at control position)
+    # Using constraint-based matching for accurate world-space alignment
     # =========================================================================
-    _match_transform(null_grp, locator_2)
+    _match_transform_world(null_grp, locator_2)
 
     # =========================================================================
     # Parent locator_1 under null_GRP
@@ -531,21 +555,17 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         return False, "Locator_2 (driver) not found."
 
     # =========================================================================
-    # Get control's current world transform (translation and rotation only)
+    # Match null_GRP to control's world position and rotation
+    # Using constraint-based matching for accurate world-space alignment
+    # regardless of the control's local space or parent hierarchy
     # =========================================================================
-    ctrl_translate, ctrl_rotate = _get_world_xform(control)
-
-    # =========================================================================
-    # Match null_GRP to control position and rotation (NOT scale)
-    # Using euler-based xform to avoid transferring scale from control
-    # =========================================================================
-    _set_world_xform(null_grp, ctrl_translate, ctrl_rotate)
+    _match_transform_world(null_grp, control)
 
     # =========================================================================
     # Match locator_1 rotation to null_GRP (reset relative rotation)
-    # Uses matrix-based rotation matching for accuracy
+    # Using constraint-based matching for accuracy across all axes
     # =========================================================================
-    _match_rotation(locator_1, null_grp)
+    _match_rotation_world(locator_1, null_grp)
 
     # =========================================================================
     # Recreate parentConstraint: locator_2 → control
