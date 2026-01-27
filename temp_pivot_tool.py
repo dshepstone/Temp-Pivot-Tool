@@ -26,7 +26,7 @@ Features:
 
 Author: David Shepstone
 License: MIT
-Version: 5.2.0
+Version: 5.2.1
 """
 
 from __future__ import annotations
@@ -531,9 +531,15 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         return False, "Locator_2 (driver) not found."
 
     # =========================================================================
-    # Match null_GRP to control using matrix (realigns entire rig properly)
+    # Get control's current world transform (translation and rotation only)
     # =========================================================================
-    _match_transform(null_grp, control)
+    ctrl_translate, ctrl_rotate = _get_world_xform(control)
+
+    # =========================================================================
+    # Match null_GRP to control position and rotation (NOT scale)
+    # Using euler-based xform to avoid transferring scale from control
+    # =========================================================================
+    _set_world_xform(null_grp, ctrl_translate, ctrl_rotate)
 
     # =========================================================================
     # Match locator_1 rotation to null_GRP (reset relative rotation)
