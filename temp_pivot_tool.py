@@ -121,16 +121,6 @@ def _get_world_xform(node: str) -> Tuple[List[float], List[float]]:
     return translate, rotate
 
 
-def _get_world_matrix(node: str) -> List[float]:
-    """Get world-space transformation matrix for a node."""
-    return cmds.xform(node, q=True, ws=True, matrix=True)
-
-
-def _set_world_matrix(node: str, matrix: List[float]) -> None:
-    """Set world-space transformation matrix for a node."""
-    cmds.xform(node, ws=True, matrix=matrix)
-
-
 def _set_world_xform(node: str, translate: List[float], rotate: List[float]) -> None:
     """Set world-space translate and rotate for a node."""
     cmds.xform(node, ws=True, t=translate)
@@ -138,10 +128,9 @@ def _set_world_xform(node: str, translate: List[float], rotate: List[float]) -> 
 
 
 def _match_transform(source: str, target: str) -> None:
-    """Match source node's world transform to target node using matrices."""
-    # Use matrix-based matching for rotation-order independence
-    matrix = _get_world_matrix(target)
-    _set_world_matrix(source, matrix)
+    """Match source node's world transform to target node."""
+    translate, rotate = _get_world_xform(target)
+    _set_world_xform(source, translate, rotate)
 
 
 def _match_translation(source: str, target: str) -> None:
@@ -151,18 +140,9 @@ def _match_translation(source: str, target: str) -> None:
 
 
 def _match_rotation(source: str, target: str) -> None:
-    """Match only rotation using matrix decomposition for accuracy."""
-    # Get the target's world matrix
-    target_matrix = _get_world_matrix(target)
-
-    # Get the source's current world position (we want to keep this)
-    source_translate = cmds.xform(source, q=True, ws=True, t=True)
-
-    # Apply the target's full matrix to source (this sets rotation correctly)
-    _set_world_matrix(source, target_matrix)
-
-    # Restore the source's original position
-    cmds.xform(source, ws=True, t=source_translate)
+    """Match only rotation."""
+    _, rotate = _get_world_xform(target)
+    cmds.xform(source, ws=True, ro=rotate)
 
 
 def _add_string_attr(node: str, attr: str, value: str = "") -> None:
@@ -289,13 +269,16 @@ def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
     # Create safe prefix
     prefix = _sanitize_name(control)
 
+    # Get control's world transform
+    ctrl_translate, ctrl_rotate = _get_world_xform(control)
+
     # =========================================================================
     # Create locator_1 (the PIVOT - user will position this)
     # =========================================================================
     locator_1 = cmds.spaceLocator(name=f"{prefix}{LOCATOR_1_SUFFIX}")[0]
 
-    # Match to control position initially (using matrix for rotation-order independence)
-    _match_transform(locator_1, control)
+    # Match to control position initially
+    _set_world_xform(locator_1, ctrl_translate, ctrl_rotate)
 
     # Style locator_1 (orange - indicates pivot point)
     loc1_shape = cmds.listRelatives(locator_1, shapes=True)[0]
@@ -388,13 +371,16 @@ def complete_setup(locator_1: str) -> Tuple[bool, str, Optional[str]]:
 
     prefix = _sanitize_name(control)
 
+    # Get control's current world transform
+    ctrl_translate, ctrl_rotate = _get_world_xform(control)
+
     # =========================================================================
     # Create locator_2 (the DRIVER) at control position
     # =========================================================================
     locator_2 = cmds.spaceLocator(name=f"{prefix}{LOCATOR_2_SUFFIX}")[0]
 
-    # Match to control position (using matrix for rotation-order independence)
-    _match_transform(locator_2, control)
+    # Match to control position
+    _set_world_xform(locator_2, ctrl_translate, ctrl_rotate)
 
     # Style locator_2 (green - indicates driver)
     loc2_shape = cmds.listRelatives(locator_2, shapes=True)[0]
@@ -517,10 +503,14 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         return False, "Locator_2 (driver) not found."
 
     # =========================================================================
-    # Match null_GRP to control (realigns entire rig)
-    # Uses matrix-based matching for rotation-order independence
+    # Get control's current world transform
     # =========================================================================
-    _match_transform(null_grp, control)
+    ctrl_translate, ctrl_rotate = _get_world_xform(control)
+
+    # =========================================================================
+    # Match null_GRP to control (realigns entire rig)
+    # =========================================================================
+    _set_world_xform(null_grp, ctrl_translate, ctrl_rotate)
 
     # =========================================================================
     # Match locator_1 rotation to null_GRP (reset relative rotation)
