@@ -16,14 +16,17 @@ Workflow:
 1. Select control, click "Create Pivot Locator" (Stage 1)
 2. Move locator_1 to where you want the pivot point
 3. Click "Complete Setup" (Stage 2) - creates driver, hierarchy, constraint
-4. Rotate locator_1 - control orbits around the pivot
-5. Key control when satisfied
-6. Toggle OFF - constraint deleted, rig hidden
-7. Toggle ON - rig realigns to control, constraint recreated
+4. Rotate locator_1 - control orbits around the pivot (auto-keys applied)
+5. Toggle OFF - constraint deleted, rig hidden
+6. Toggle ON - rig realigns to control, constraint recreated
+
+Features:
+- Auto-key: When you rotate locator_1, keyframes are automatically set on the control
+- Matrix-based alignment: Proper rotation alignment across all axes (X, Y, Z)
 
 Author: David Shepstone
 License: MIT
-Version: 5.1.0
+Version: 5.2.0
 """
 
 from __future__ import annotations
@@ -47,6 +50,9 @@ LOCATOR_1_SUFFIX = f"_{TOOL_PREFIX}_locator_1"  # PIVOT - user positions this
 LOCATOR_2_SUFFIX = f"_{TOOL_PREFIX}_locator_2"  # DRIVER - constrains control
 SETTINGS_SUFFIX = f"_{TOOL_PREFIX}_settings"
 CONSTRAINT_SUFFIX = f"_{TOOL_PREFIX}_parentConstraint"
+
+# Auto-key scriptJob storage (keyed by settings node name)
+_auto_key_jobs: Dict[str, List[int]] = {}
 
 # UI Colors
 UI_COLORS = {
@@ -86,7 +92,8 @@ TOOLTIPS = {
     ),
     "key_btn": (
         "Set keyframes on the control's translate and rotate.\n"
-        "Use this to 'commit' the pose while pivot is active."
+        "Note: Keys are set automatically when you rotate locator_1.\n"
+        "Use this button for manual keying if needed."
     ),
     "delete_btn": (
         "Delete the temp pivot rig completely.\n"
@@ -127,10 +134,21 @@ def _set_world_xform(node: str, translate: List[float], rotate: List[float]) -> 
     cmds.xform(node, ws=True, ro=rotate)
 
 
+def _get_world_matrix(node: str) -> List[float]:
+    """Get the world matrix of a node as a flat list of 16 floats."""
+    return cmds.xform(node, q=True, ws=True, matrix=True)
+
+
+def _set_world_matrix(node: str, matrix: List[float]) -> None:
+    """Set the world matrix of a node from a flat list of 16 floats."""
+    cmds.xform(node, ws=True, matrix=matrix)
+
+
 def _match_transform(source: str, target: str) -> None:
-    """Match source node's world transform to target node."""
-    translate, rotate = _get_world_xform(target)
-    _set_world_xform(source, translate, rotate)
+    """Match source node's world transform to target node using matrix."""
+    # Use matrix-based matching which properly handles all rotation orders
+    matrix = _get_world_matrix(target)
+    _set_world_matrix(source, matrix)
 
 
 def _match_translation(source: str, target: str) -> None:
@@ -140,9 +158,16 @@ def _match_translation(source: str, target: str) -> None:
 
 
 def _match_rotation(source: str, target: str) -> None:
-    """Match only rotation."""
-    _, rotate = _get_world_xform(target)
-    cmds.xform(source, ws=True, ro=rotate)
+    """Match only rotation using matrix decomposition for accuracy."""
+    # Get target's world matrix and extract rotation properly
+    # by applying just the rotation component to the source
+    target_matrix = _get_world_matrix(target)
+    source_translate = cmds.xform(source, q=True, ws=True, t=True)
+
+    # Build a new matrix with source's translation but target's rotation/scale
+    # Matrix layout: [r00,r01,r02,0, r10,r11,r12,0, r20,r21,r22,0, tx,ty,tz,1]
+    new_matrix = target_matrix[:12] + source_translate + [1.0]
+    _set_world_matrix(source, new_matrix)
 
 
 def _add_string_attr(node: str, attr: str, value: str = "") -> None:
@@ -454,10 +479,13 @@ def complete_setup(locator_1: str) -> Tuple[bool, str, Optional[str]]:
             cmds.setAttr(f"{shape}.overrideColorG", UI_COLORS["success"][1])
             cmds.setAttr(f"{shape}.overrideColorB", UI_COLORS["success"][2])
 
+    # Set up auto-key for rotation changes
+    setup_auto_key(settings_node)
+
     # Select locator_1 so user can start using it
     cmds.select(locator_1)
 
-    return True, f"Setup complete! Rotate locator_1 to orbit '{control}' around pivot.", settings_node
+    return True, f"Setup complete! Rotate locator_1 to orbit '{control}' around pivot. Auto-key enabled.", settings_node
 
 
 # =============================================================================
@@ -503,17 +531,13 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         return False, "Locator_2 (driver) not found."
 
     # =========================================================================
-    # Get control's current world transform
+    # Match null_GRP to control using matrix (realigns entire rig properly)
     # =========================================================================
-    ctrl_translate, ctrl_rotate = _get_world_xform(control)
-
-    # =========================================================================
-    # Match null_GRP to control (realigns entire rig)
-    # =========================================================================
-    _set_world_xform(null_grp, ctrl_translate, ctrl_rotate)
+    _match_transform(null_grp, control)
 
     # =========================================================================
     # Match locator_1 rotation to null_GRP (reset relative rotation)
+    # Uses matrix-based rotation matching for accuracy
     # =========================================================================
     _match_rotation(locator_1, null_grp)
 
@@ -549,10 +573,13 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
             cmds.setAttr(f"{shape}.overrideColorG", UI_COLORS["success"][1])
             cmds.setAttr(f"{shape}.overrideColorB", UI_COLORS["success"][2])
 
+    # Set up auto-key for rotation changes
+    setup_auto_key(settings_node)
+
     # Select locator_1
     cmds.select(locator_1)
 
-    return True, f"Pivot ON. Rotate locator_1 to orbit '{control}'."
+    return True, f"Pivot ON. Rotate locator_1 to orbit '{control}'. Auto-key enabled."
 
 
 # =============================================================================
@@ -564,9 +591,10 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     Deactivate the temp pivot system.
 
     Process:
-    1. Delete the constraint
-    2. Hide visibility
-    3. Control stays in place (user should have keyed it)
+    1. Clean up auto-key scriptJobs
+    2. Delete the constraint
+    3. Hide visibility
+    4. Control stays in place (user should have keyed it)
 
     Args:
         settings_node: The settings node for this rig
@@ -585,6 +613,11 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     constraint = nodes["constraint"]
     null_grp = nodes["null_grp"]
     locator_1 = nodes["locator_1"]
+
+    # =========================================================================
+    # Clean up auto-key scriptJobs
+    # =========================================================================
+    cleanup_auto_key(settings_node)
 
     # =========================================================================
     # Delete the constraint
@@ -673,6 +706,63 @@ def key_control(settings_node: str) -> Tuple[bool, str]:
 
 
 # =============================================================================
+# AUTO-KEY MANAGEMENT
+# =============================================================================
+
+def _create_auto_key_callback(settings_node: str):
+    """Create a callback function for auto-keying that captures the settings node."""
+    def auto_key_callback():
+        # Only key if the rig is still active
+        if cmds.objExists(settings_node) and is_rig_active(settings_node):
+            key_control(settings_node)
+    return auto_key_callback
+
+
+def setup_auto_key(settings_node: str) -> None:
+    """Set up scriptJobs to auto-key the control when locator_1 is rotated."""
+    global _auto_key_jobs
+
+    # Clean up any existing jobs for this rig
+    cleanup_auto_key(settings_node)
+
+    if not cmds.objExists(settings_node):
+        return
+
+    nodes = get_rig_nodes(settings_node)
+    locator_1 = nodes["locator_1"]
+
+    if not locator_1 or not cmds.objExists(locator_1):
+        return
+
+    # Create callback function
+    callback = _create_auto_key_callback(settings_node)
+
+    # Set up scriptJobs for rotation attribute changes
+    job_ids = []
+    for attr in ["rx", "ry", "rz"]:
+        attr_path = f"{locator_1}.{attr}"
+        if cmds.objExists(attr_path):
+            job_id = cmds.scriptJob(
+                attributeChange=[attr_path, callback],
+                killWithScene=True
+            )
+            job_ids.append(job_id)
+
+    _auto_key_jobs[settings_node] = job_ids
+
+
+def cleanup_auto_key(settings_node: str) -> None:
+    """Remove auto-key scriptJobs for a rig."""
+    global _auto_key_jobs
+
+    if settings_node in _auto_key_jobs:
+        for job_id in _auto_key_jobs[settings_node]:
+            if cmds.scriptJob(exists=job_id):
+                cmds.scriptJob(kill=job_id, force=True)
+        del _auto_key_jobs[settings_node]
+
+
+# =============================================================================
 # DELETE RIG
 # =============================================================================
 
@@ -683,6 +773,9 @@ def delete_pivot_rig(settings_node: str) -> Tuple[bool, str]:
 
     nodes = get_rig_nodes(settings_node)
     control = nodes["control"]
+
+    # Clean up auto-key scriptJobs (in case they exist)
+    cleanup_auto_key(settings_node)
 
     # Toggle off first
     if is_rig_active(settings_node):
@@ -1180,10 +1273,14 @@ def show() -> None:
 
     def on_complete_setup(*args):
         ctx_type, ctx_node = get_current_context()
+        locator_to_select = None
 
         if ctx_type == "pending":
             success, msg, settings = complete_setup(ctx_node)
             log_message(msg, "success" if success else "error")
+            if success and settings:
+                nodes = get_rig_nodes(settings)
+                locator_to_select = nodes["locator_1"]
         elif ctx_type == "rig":
             log_message("Setup already complete. Use Toggle to activate.", "warning")
         else:
@@ -1194,14 +1291,23 @@ def show() -> None:
                 if pending:
                     success, msg, settings = complete_setup(pending)
                     log_message(msg, "success" if success else "error")
+                    if success and settings:
+                        nodes = get_rig_nodes(settings)
+                        locator_to_select = nodes["locator_1"]
                     refresh_rig_list()
                     update_status()
+                    # Ensure locator_1 is selected after UI updates
+                    if locator_to_select and cmds.objExists(locator_to_select):
+                        cmds.evalDeferred(lambda loc=locator_to_select: cmds.select(loc))
                     return
 
             log_message("No pending pivot locator found. Create one first.", "warning")
 
         refresh_rig_list()
         update_status()
+        # Ensure locator_1 is selected after UI updates
+        if locator_to_select and cmds.objExists(locator_to_select):
+            cmds.evalDeferred(lambda loc=locator_to_select: cmds.select(loc))
 
     def on_toggle(*args):
         ctx_type, ctx_node = get_current_context()
