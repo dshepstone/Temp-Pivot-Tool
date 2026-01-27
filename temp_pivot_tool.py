@@ -23,7 +23,7 @@ Workflow:
 
 Author: David Shepstone
 License: MIT
-Version: 5.0.0
+Version: 5.1.0
 """
 
 from __future__ import annotations
@@ -978,13 +978,18 @@ def show() -> None:
     )
 
     list_btns = cmds.rowLayout(
-        numberOfColumns=2,
+        numberOfColumns=3,
         adjustableColumn=1,
-        columnWidth2=(160, 160)
+        columnWidth3=(105, 105, 105)
     )
 
     toggle_list_btn = cmds.button(
         label="Toggle Selected",
+        height=26
+    )
+
+    delete_list_btn = cmds.button(
+        label="Delete Selected",
         height=26
     )
 
@@ -1026,6 +1031,10 @@ def show() -> None:
     # CALLBACKS
     # ==========================================
 
+    # Flag to prevent list refresh during programmatic selection from the list
+    # Using a list so we can modify it from nested functions
+    _skip_list_refresh = [False]
+
     def log_message(message: str, msg_type: str = "info") -> None:
         prefix_map = {"warning": "[!] ", "error": "[X] ", "success": "[OK] ", "info": ""}
         prefix = prefix_map.get(msg_type, "")
@@ -1036,7 +1045,20 @@ def show() -> None:
         cmds.scrollField(log_field, edit=True, text=new_text)
         cmds.scrollField(log_field, edit=True, insertionPosition=len(new_text))
 
-    def refresh_rig_list() -> None:
+    def refresh_rig_list(preserve_selection: bool = True) -> None:
+        """Refresh the rig list, optionally preserving the current selection."""
+        # Skip refresh if triggered by our own list selection
+        if _skip_list_refresh[0]:
+            return
+
+        # Save current selection before clearing
+        selected_control = None
+        if preserve_selection:
+            selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
+            if selected_items:
+                # Extract control name (without status suffix)
+                selected_control = selected_items[0].split(" [")[0]
+
         cmds.textScrollList(rig_list, edit=True, removeAll=True)
         rigs = get_all_pivot_rigs()
         for settings in sorted(rigs):
@@ -1045,6 +1067,14 @@ def show() -> None:
             active = is_rig_active(settings)
             status = " [ON]" if active else " [OFF]"
             cmds.textScrollList(rig_list, edit=True, append=f"{control}{status}")
+
+        # Restore selection if we had one
+        if selected_control:
+            all_items = cmds.textScrollList(rig_list, query=True, allItems=True) or []
+            for item in all_items:
+                if item.startswith(selected_control + " ["):
+                    cmds.textScrollList(rig_list, edit=True, selectItem=item)
+                    break
 
     def update_status() -> None:
         sel = cmds.ls(selection=True, type="transform") or []
@@ -1244,6 +1274,7 @@ def show() -> None:
             log_message("No control found.", "warning")
 
     def on_list_select(*args):
+        """Handle selection in the rig list - select the locator in viewport."""
         selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
         if selected_items:
             control_name = selected_items[0].split(" [")[0]
@@ -1252,7 +1283,13 @@ def show() -> None:
                 nodes = get_rig_nodes(settings)
                 loc1 = nodes["locator_1"]
                 if loc1 and cmds.objExists(loc1):
-                    cmds.select(loc1)
+                    # Set flag to prevent refresh from wiping out our list selection
+                    _skip_list_refresh[0] = True
+                    try:
+                        cmds.select(loc1)
+                    finally:
+                        # Use evalDeferred to reset flag after Maya processes the selection
+                        cmds.evalDeferred(lambda: _skip_list_refresh.__setitem__(0, False))
         update_status()
 
     def on_list_toggle(*args):
@@ -1268,6 +1305,20 @@ def show() -> None:
             refresh_rig_list()
             update_status()
 
+    def on_list_delete(*args):
+        """Delete the rig selected in the list."""
+        selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
+        if not selected_items:
+            log_message("Select a rig from the list to delete.", "warning")
+            return
+        control_name = selected_items[0].split(" [")[0]
+        settings = get_rig_for_control(control_name)
+        if settings:
+            success, msg = delete_pivot_rig(settings)
+            log_message(msg, "success" if success else "error")
+            refresh_rig_list(preserve_selection=False)
+            update_status()
+
     # Connect callbacks
 
     cmds.button(create_pivot_btn, edit=True, command=on_create_pivot)
@@ -1278,6 +1329,7 @@ def show() -> None:
     cmds.button(select_pivot_btn, edit=True, command=on_select_pivot)
     cmds.button(select_control_btn, edit=True, command=on_select_control)
     cmds.button(toggle_list_btn, edit=True, command=on_list_toggle)
+    cmds.button(delete_list_btn, edit=True, command=on_list_delete)
     cmds.button(refresh_btn, edit=True, command=lambda *_: refresh_rig_list())
 
     cmds.textScrollList(rig_list, edit=True, selectCommand=on_list_select)
