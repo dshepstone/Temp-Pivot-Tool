@@ -27,7 +27,7 @@ Features:
 
 Author: David Shepstone
 License: MIT
-Version: 5.3.0
+Version: 5.4.0
 """
 
 from __future__ import annotations
@@ -521,11 +521,14 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     Reactivate the temp pivot system.
 
     Process:
-    1. Get control's current world transform
-    2. Match null_GRP to control (realigns rig)
-    3. Match locator_1 rotation to null_GRP (reset relative rotation)
-    4. Recreate parentConstraint: locator_2 → control (maintainOffset)
-    5. Show visibility
+    1. Match null_GRP to control (realigns rig to control's current position)
+    2. Match locator_1 fully to null_GRP (reset BOTH position AND rotation)
+    3. Recreate parentConstraint: locator_2 → control (maintainOffset)
+    4. Show visibility
+
+    Note: locator_1 is fully reset on toggle_on, so the user starts fresh
+    with the pivot at the control's position. This ensures consistent
+    alignment regardless of how many times toggle is used.
 
     Args:
         settings_node: The settings node for this rig
@@ -562,10 +565,11 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     _match_transform_world(null_grp, control)
 
     # =========================================================================
-    # Match locator_1 rotation to null_GRP (reset relative rotation)
-    # Using constraint-based matching for accuracy across all axes
+    # Match locator_1 FULLY to null_GRP (reset BOTH position AND rotation)
+    # This ensures the rig is completely realigned for a fresh pivot session
+    # The user can then reposition locator_1 to set a new pivot point
     # =========================================================================
-    _match_rotation_world(locator_1, null_grp)
+    _match_transform_world(locator_1, null_grp)
 
     # =========================================================================
     # Recreate parentConstraint: locator_2 → control
@@ -745,7 +749,7 @@ def _create_auto_key_callback(settings_node: str):
 
 
 def setup_auto_key(settings_node: str) -> None:
-    """Set up scriptJobs to auto-key the control when locator_1 is rotated."""
+    """Set up scriptJobs to auto-key the control when locator_1 is transformed."""
     global _auto_key_jobs
 
     # Clean up any existing jobs for this rig
@@ -763,9 +767,9 @@ def setup_auto_key(settings_node: str) -> None:
     # Create callback function
     callback = _create_auto_key_callback(settings_node)
 
-    # Set up scriptJobs for rotation attribute changes
+    # Set up scriptJobs for BOTH translation AND rotation attribute changes
     job_ids = []
-    for attr in ["rx", "ry", "rz"]:
+    for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
         attr_path = f"{locator_1}.{attr}"
         if cmds.objExists(attr_path):
             job_id = cmds.scriptJob(
