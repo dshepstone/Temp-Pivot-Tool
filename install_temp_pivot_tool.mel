@@ -4,32 +4,30 @@
 //
 // Drag and drop this file into Maya to install the Temp Pivot Tool.
 //
-// A non-destructive, reusable temporary pivot system where:
-//   - The rig is never rebuilt - only constraints are created/deleted
-//   - The null group acts as the anchor for realigning the entire system
-//   - Locator 2 defines the pivot point
-//   - Locator 1 is the constraint driver
+// TWO-STAGE SETUP PROCESS:
+//   Stage 1: Create locator_1 (pivot) - user moves this to desired pivot location
+//   Stage 2: Complete setup - creates locator_2 (driver), null_GRP, parenting, constraint
 //
 // Hierarchy Structure:
-//   null_GRP (anchor - for realigning system)
-//     └ locator_2 (PIVOT - user positions this)
-//         └ locator_1 (DRIVER - constrains the object)
+//   null_GRP (anchor - at control position)
+//     └ locator_1 (PIVOT - user positioned this in Stage 1)
+//         └ locator_2 (DRIVER - at control position, constrains control)
 //
 // Workflow:
-//   1. Select control, click Setup
-//   2. Move locator_2 to set pivot point
-//   3. Toggle ON - constraint created, control follows pivot
-//   4. Rotate locator_2 - control orbits around pivot
+//   1. Select control, click "Create Pivot Locator" (Stage 1)
+//   2. Move locator_1 to where you want the pivot point
+//   3. Click "Complete Setup" (Stage 2)
+//   4. Rotate locator_1 - control orbits around the pivot
 //   5. Key control when satisfied
-//   6. Toggle OFF - constraint deleted, control stays in place
-//   7. Toggle ON again - rig realigns to control's new position
+//   6. Toggle OFF - constraint deleted, rig hidden
+//   7. Toggle ON - rig realigns to control, constraint recreated
 //
 // Author: David Shepstone
 // License: MIT
-// Version: 4.1.0
+// Version: 5.0.0
 // ============================================================================
 
-global string $tempPivotToolVersion = "4.1.0";
+global string $tempPivotToolVersion = "5.0.0";
 
 // ----------------------------------------------------------------------------
 // Get the directory where this installer script is located
@@ -48,7 +46,6 @@ global proc string tempPivotInstall_GetScriptDir()
         $path = substituteAllString($info, "Script found in: ", "");
     }
 
-    // Normalize path separators
     $path = substituteAllString($path, "\\", "/");
 
     if ($path == "")
@@ -73,7 +70,6 @@ global proc int tempPivot_DoCopy(string $source, string $destination)
         return 0;
     }
 
-    // Create destination directory if it doesn't exist
     string $destDir = `dirname $cleanDest`;
     if (!`filetest -d $destDir`)
     {
@@ -81,7 +77,6 @@ global proc int tempPivot_DoCopy(string $source, string $destination)
         sysFile -makeDir $destDir;
     }
 
-    // Copy the file
     int $result = `sysFile -copy $cleanDest $cleanSource`;
 
     if (!$result)
@@ -115,7 +110,6 @@ global proc tempPivotInstall_CreateShelfButton(string $iconName)
         return;
     }
 
-    // Check if button already exists and remove it
     string $existingButtons[] = `shelfLayout -q -childArray $currentShelf`;
     for ($btn in $existingButtons)
     {
@@ -130,7 +124,6 @@ global proc tempPivotInstall_CreateShelfButton(string $iconName)
         }
     }
 
-    // Create new shelf button
     shelfButton
         -parent $currentShelf
         -label "Temp Pivot"
@@ -172,24 +165,20 @@ global proc tempPivot_Install()
     print "============================================================\n";
     print "\n";
 
-    // Get the installer's base directory
     string $baseDir = tempPivotInstall_GetScriptDir();
     $baseDir = substituteAllString($baseDir, "\\", "/");
 
     print ("Source directory: " + $baseDir + "\n\n");
 
-    // Define source files
     string $pyFile = "temp_pivot_tool.py";
     string $iconFile = "temp-pivot.png";
 
     string $srcPy = ($baseDir + "/" + $pyFile);
     string $srcIcon = ($baseDir + "/" + $iconFile);
 
-    // Get Maya user directories
     string $userScripts = substituteAllString(`internalVar -userScriptDir`, "\\", "/");
     string $userIcons = substituteAllString(`internalVar -userBitmapsDir`, "\\", "/");
 
-    // Ensure trailing slashes
     if (!`gmatch $userScripts "*/"`)
     {
         $userScripts += "/";
@@ -199,16 +188,13 @@ global proc tempPivot_Install()
         $userIcons += "/";
     }
 
-    // Define destination paths
     string $destPy = ($userScripts + $pyFile);
     string $destIcon = ($userIcons + $iconFile);
 
     print "Installing files:\n";
 
-    // Clean old installation
     tempPivot_CleanOldInstall();
 
-    // Copy files
     int $pySuccess = tempPivot_DoCopy($srcPy, $destPy);
     int $iconSuccess = tempPivot_DoCopy($srcIcon, $destIcon);
 
@@ -220,10 +206,8 @@ global proc tempPivot_Install()
 
     print "\nCreating shelf button:\n";
 
-    // Create shelf button
     tempPivotInstall_CreateShelfButton($iconFile);
 
-    // Print success message
     print "\n";
     print "============================================================\n";
     print "  Installation Complete!\n";
@@ -237,23 +221,30 @@ global proc tempPivot_Install()
     print "  - Click the 'Temp Pivot' button on your shelf\n";
     print "  - Or run: import temp_pivot_tool; temp_pivot_tool.show()\n";
     print "\n";
-    print "Workflow:\n";
-    print "  1. Select a control (e.g., IK foot)\n";
-    print "  2. Click 'Setup Pivot Rig'\n";
-    print "  3. Move locator_2 to desired pivot point\n";
-    print "  4. Click 'Toggle ON' to activate\n";
-    print "  5. Rotate locator_2 - control orbits around pivot\n";
-    print "  6. Click 'Key Control' to set keyframe\n";
-    print "  7. Click 'Toggle OFF' when done\n";
-    print "  8. Toggle ON again to realign and continue\n";
+    print "TWO-STAGE WORKFLOW:\n";
+    print "\n";
+    print "  STAGE 1: Create Pivot Locator\n";
+    print "    1. Select a control (e.g., IK foot)\n";
+    print "    2. Click 'Create Pivot Locator'\n";
+    print "    3. Move locator_1 to desired pivot point\n";
+    print "\n";
+    print "  STAGE 2: Complete Setup\n";
+    print "    4. Click 'Complete Setup'\n";
+    print "    5. Rotate locator_1 - control orbits around pivot\n";
+    print "    6. Click 'Key Control' to set keyframe\n";
+    print "    7. Click 'Toggle OFF' when done\n";
+    print "\n";
+    print "  REPEAT:\n";
+    print "    8. Move control to new position\n";
+    print "    9. Click 'Toggle ON' - rig realigns\n";
+    print "   10. Rotate pivot, Key, Toggle OFF\n";
     print "\n";
     print "Hierarchy created:\n";
     print "  null_GRP (realignment anchor)\n";
-    print "    + locator_2 (pivot point - move this)\n";
-    print "        + locator_1 (driver - constrains control)\n";
+    print "    + locator_1 (PIVOT - rotate this)\n";
+    print "        + locator_2 (DRIVER - constrains control)\n";
     print "\n";
 
-    // Optionally launch the tool
     print "Launching Temp Pivot Tool...\n\n";
     python("import temp_pivot_tool; temp_pivot_tool.show()");
 }
@@ -268,7 +259,6 @@ global proc tempPivot_Uninstall()
     print "\n";
     print "Uninstalling Temp Pivot Tool...\n";
 
-    // Remove Python script
     string $userScripts = substituteAllString(`internalVar -userScriptDir`, "\\", "/");
     string $pyFile = $userScripts + "temp_pivot_tool.py";
 
@@ -278,7 +268,6 @@ global proc tempPivot_Uninstall()
         print ("  Removed: " + $pyFile + "\n");
     }
 
-    // Remove icon
     string $userIcons = substituteAllString(`internalVar -userBitmapsDir`, "\\", "/");
     string $iconFile = $userIcons + "temp-pivot.png";
 
@@ -288,7 +277,6 @@ global proc tempPivot_Uninstall()
         print ("  Removed: " + $iconFile + "\n");
     }
 
-    // Remove shelf buttons
     if (`tabLayout -exists $gShelfTopLevel`)
     {
         string $shelves[] = `tabLayout -q -childArray $gShelfTopLevel`;
@@ -310,7 +298,6 @@ global proc tempPivot_Uninstall()
         }
     }
 
-    // Close the tool window if open
     if (`window -exists "tempPivotToolWindow"`)
     {
         deleteUI "tempPivotToolWindow";
