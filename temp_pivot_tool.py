@@ -27,7 +27,7 @@ Features:
 
 Author: David Shepstone
 License: MIT
-Version: 5.4.0
+Version: 5.4.1
 """
 
 from __future__ import annotations
@@ -522,13 +522,12 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
 
     Process:
     1. Match null_GRP to control (realigns rig to control's current position)
-    2. Match locator_1 fully to null_GRP (reset BOTH position AND rotation)
+    2. Reset locator_1's LOCAL rotation to zero (preserve pivot offset translation)
     3. Recreate parentConstraint: locator_2 → control (maintainOffset)
     4. Show visibility
 
-    Note: locator_1 is fully reset on toggle_on, so the user starts fresh
-    with the pivot at the control's position. This ensures consistent
-    alignment regardless of how many times toggle is used.
+    Note: locator_1's local translation (pivot offset) is PRESERVED.
+    Only the local rotation is reset so orbital rotation starts fresh.
 
     Args:
         settings_node: The settings node for this rig
@@ -565,11 +564,12 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     _match_transform_world(null_grp, control)
 
     # =========================================================================
-    # Match locator_1 FULLY to null_GRP (reset BOTH position AND rotation)
-    # This ensures the rig is completely realigned for a fresh pivot session
-    # The user can then reposition locator_1 to set a new pivot point
+    # Reset locator_1's LOCAL rotation to zero (preserve pivot offset position)
+    # This resets the orbital rotation while maintaining the pivot point offset
     # =========================================================================
-    _match_transform_world(locator_1, null_grp)
+    cmds.setAttr(f"{locator_1}.rx", 0)
+    cmds.setAttr(f"{locator_1}.ry", 0)
+    cmds.setAttr(f"{locator_1}.rz", 0)
 
     # =========================================================================
     # Recreate parentConstraint: locator_2 → control
