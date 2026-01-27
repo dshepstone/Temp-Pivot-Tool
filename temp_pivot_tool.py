@@ -23,7 +23,7 @@ Workflow:
 
 Author: David Shepstone
 License: MIT
-Version: 5.0.0
+Version: 5.1.0
 """
 
 from __future__ import annotations
@@ -469,11 +469,13 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     Reactivate the temp pivot system.
 
     Process:
-    1. Get control's current world transform
-    2. Match null_GRP to control (realigns rig)
-    3. Match locator_1 rotation to null_GRP (reset relative rotation)
-    4. Recreate parentConstraint: locator_2 → control (maintainOffset)
-    5. Show visibility
+    1. Unparent locator_1 temporarily (to avoid hierarchy transform issues)
+    2. Match null_GRP to control (position and rotation)
+    3. Match locator_1 to null_GRP (reset to anchor position)
+    4. Re-parent locator_1 under null_GRP
+    5. Match locator_2 to control (so driver is at control position)
+    6. Recreate parentConstraint: locator_2 → control (maintainOffset)
+    7. Show visibility
 
     Args:
         settings_node: The settings node for this rig
@@ -508,14 +510,32 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     ctrl_translate, ctrl_rotate = _get_world_xform(control)
 
     # =========================================================================
-    # Match null_GRP to control (realigns entire rig)
+    # Temporarily unparent locator_1 to avoid hierarchy transform issues
+    # When setting transforms on parent nodes, children can be affected unexpectedly
+    # =========================================================================
+    cmds.parent(locator_1, world=True)
+
+    # =========================================================================
+    # Match null_GRP to control (position and rotation)
     # =========================================================================
     _set_world_xform(null_grp, ctrl_translate, ctrl_rotate)
 
     # =========================================================================
-    # Match locator_1 rotation to null_GRP (reset relative rotation)
+    # Match locator_1 to null_GRP (reset pivot to anchor position)
+    # This resets the pivot offset so it starts fresh at the control location
     # =========================================================================
-    _match_rotation(locator_1, null_grp)
+    _match_transform(locator_1, null_grp)
+
+    # =========================================================================
+    # Re-parent locator_1 under null_GRP
+    # =========================================================================
+    cmds.parent(locator_1, null_grp)
+
+    # =========================================================================
+    # Match locator_2 to control (critical for correct constraint behavior)
+    # This ensures the driver is at the exact control position/rotation
+    # =========================================================================
+    _match_transform(locator_2, control)
 
     # =========================================================================
     # Recreate parentConstraint: locator_2 → control
