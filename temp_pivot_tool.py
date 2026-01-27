@@ -1037,6 +1037,13 @@ def show() -> None:
         cmds.scrollField(log_field, edit=True, insertionPosition=len(new_text))
 
     def refresh_rig_list() -> None:
+        # Preserve the currently selected item before clearing
+        selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
+        selected_control = None
+        if selected_items:
+            # Extract control name (strip " [ON]" or " [OFF]" suffix)
+            selected_control = selected_items[0].split(" [")[0]
+
         cmds.textScrollList(rig_list, edit=True, removeAll=True)
         rigs = get_all_pivot_rigs()
         for settings in sorted(rigs):
@@ -1045,6 +1052,14 @@ def show() -> None:
             active = is_rig_active(settings)
             status = " [ON]" if active else " [OFF]"
             cmds.textScrollList(rig_list, edit=True, append=f"{control}{status}")
+
+        # Restore selection if the item still exists in the list
+        if selected_control:
+            all_items = cmds.textScrollList(rig_list, query=True, allItems=True) or []
+            for item in all_items:
+                if item.startswith(selected_control + " ["):
+                    cmds.textScrollList(rig_list, edit=True, selectItem=item)
+                    break
 
     def update_status() -> None:
         sel = cmds.ls(selection=True, type="transform") or []
