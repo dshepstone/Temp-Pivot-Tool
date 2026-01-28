@@ -36,6 +36,7 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import maya.cmds as cmds
+import maya.OpenMaya as om
 
 # -----------------------------
 # Constants
@@ -202,6 +203,87 @@ def _add_bool_attr(node: str, attr: str, value: bool = False) -> None:
     if not cmds.attributeQuery(attr, node=node, exists=True):
         cmds.addAttr(node, longName=attr, attributeType="bool")
     cmds.setAttr(f"{node}.{attr}", value)
+
+
+def _add_double_array_attr(node: str, attr: str) -> None:
+    """Add a doubleArray attribute if it doesn't exist."""
+    if not cmds.attributeQuery(attr, node=node, exists=True):
+        cmds.addAttr(node, longName=attr, dataType="doubleArray")
+
+
+def _get_world_matrix(node: str) -> List[float]:
+    """Get world-space matrix as a 16-float list."""
+    return cmds.xform(node, q=True, ws=True, matrix=True)
+
+
+def _set_world_matrix(node: str, matrix: List[float]) -> None:
+    """Set world-space matrix from a 16-float list."""
+    cmds.xform(node, ws=True, matrix=matrix)
+
+
+def _mmatrix_from_list(values: List[float]) -> om.MMatrix:
+    """Create an MMatrix from a 16-float list."""
+    matrix = om.MMatrix()
+    om.MScriptUtil.createMatrixFromList(values, matrix)
+    return matrix
+
+
+def _matrix_to_list(matrix: om.MMatrix) -> List[float]:
+    """Convert MMatrix to a 16-float list (row-major)."""
+    return [matrix(i, j) for i in range(4) for j in range(4)]
+
+
+def _multiply_matrices(a: List[float], b: List[float]) -> List[float]:
+    """Multiply two 4x4 matrices (a * b)."""
+    return _matrix_to_list(_mmatrix_from_list(a) * _mmatrix_from_list(b))
+
+
+def _inverse_matrix(matrix: List[float]) -> List[float]:
+    """Invert a 4x4 matrix."""
+    return _matrix_to_list(_mmatrix_from_list(matrix).inverse())
+
+
+def _get_double_array_attr(node: str, attr: str) -> Optional[List[float]]:
+    """Get a doubleArray attribute as a list of floats."""
+    if not cmds.attributeQuery(attr, node=node, exists=True):
+        return None
+    value = cmds.getAttr(f"{node}.{attr}")
+    if not value:
+        return None
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], (list, tuple)):
+        value = value[0]
+    return list(value)
+
+
+def _set_double_array_attr(node: str, attr: str, values: List[float]) -> None:
+    """Set a doubleArray attribute from a list of floats."""
+    _add_double_array_attr(node, attr)
+    cmds.setAttr(f"{node}.{attr}", len(values), *values, type="doubleArray")
+
+
+def _store_pivot_offset_rig_space(settings_node: str, null_grp: str, locator_2: str) -> None:
+    """Store locator_2 offset relative to null_grp in rig space."""
+    null_world = _get_world_matrix(null_grp)
+    locator_world = _get_world_matrix(locator_2)
+    pivot_offset = _multiply_matrices(_inverse_matrix(null_world), locator_world)
+    _set_double_array_attr(settings_node, "pivotOffsetRigMtx", pivot_offset)
+
+
+def _get_pivot_offset_rig_space(
+    settings_node: str,
+    null_grp: str,
+    locator_2: str
+) -> List[float]:
+    """Get stored locator_2 offset in rig space, or initialize if missing."""
+    pivot_offset = _get_double_array_attr(settings_node, "pivotOffsetRigMtx")
+    if pivot_offset and len(pivot_offset) == 16:
+        return pivot_offset
+
+    null_world = _get_world_matrix(null_grp)
+    locator_world = _get_world_matrix(locator_2)
+    pivot_offset = _multiply_matrices(_inverse_matrix(null_world), locator_world)
+    _set_double_array_attr(settings_node, "pivotOffsetRigMtx", pivot_offset)
+    return pivot_offset
 
 
 # -----------------------------
@@ -488,6 +570,7 @@ def complete_setup(locator_1: str) -> Tuple[bool, str, Optional[str]]:
     _add_string_attr(settings_node, "locator2", locator_2)
     _add_string_attr(settings_node, "constraintName", constraint)
     _add_bool_attr(settings_node, "isActive", True)
+    _store_pivot_offset_rig_space(settings_node, null_grp, locator_2)
 
     # Parent settings under null_grp
     cmds.parent(settings_node, null_grp)
@@ -522,12 +605,9 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
 
     Process:
     1. Match null_GRP to control (realigns rig to control's current position)
-    2. Reset locator_1's LOCAL rotation to zero (preserve pivot offset translation)
+    2. Restore locator_2 from stored rig-space pivot offset
     3. Recreate parentConstraint: locator_2 → control (maintainOffset)
     4. Show visibility
-
-    Note: locator_1's local translation (pivot offset) is PRESERVED.
-    Only the local rotation is reset so orbital rotation starts fresh.
 
     Args:
         settings_node: The settings node for this rig
@@ -557,19 +637,25 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         return False, "Locator_2 (driver) not found."
 
     # =========================================================================
-    # Match null_GRP to control's world position and rotation
-    # Using constraint-based matching for accurate world-space alignment
-    # regardless of the control's local space or parent hierarchy
+    # Validate selection (warn if selection doesn't match control)
     # =========================================================================
-    _match_transform_world(null_grp, control)
+    selection = cmds.ls(selection=True, type="transform") or []
+    if len(selection) != 1 or selection[0] != control:
+        cmds.warning(f"Toggle ON expects '{control}' selected. Proceeding with stored rig target.")
 
     # =========================================================================
-    # Reset locator_1's LOCAL rotation to zero (preserve pivot offset position)
-    # This resets the orbital rotation while maintaining the pivot point offset
+    # Match null_GRP to control's world position and rotation
+    # Using world matrix alignment to follow the control's current transform
     # =========================================================================
-    cmds.setAttr(f"{locator_1}.rx", 0)
-    cmds.setAttr(f"{locator_1}.ry", 0)
-    cmds.setAttr(f"{locator_1}.rz", 0)
+    control_world = _get_world_matrix(control)
+    _set_world_matrix(null_grp, control_world)
+
+    # =========================================================================
+    # Restore locator_2 from stored rig-space offset
+    # =========================================================================
+    pivot_offset = _get_pivot_offset_rig_space(settings_node, null_grp, locator_2)
+    locator2_world = _multiply_matrices(control_world, pivot_offset)
+    _set_world_matrix(locator_2, locator2_world)
 
     # =========================================================================
     # Recreate parentConstraint: locator_2 → control
@@ -643,11 +729,18 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     constraint = nodes["constraint"]
     null_grp = nodes["null_grp"]
     locator_1 = nodes["locator_1"]
+    locator_2 = nodes["locator_2"]
 
     # =========================================================================
     # Clean up auto-key scriptJobs
     # =========================================================================
     cleanup_auto_key(settings_node)
+
+    # =========================================================================
+    # Store pivot offset in rig space before turning off
+    # =========================================================================
+    if null_grp and locator_2 and cmds.objExists(null_grp) and cmds.objExists(locator_2):
+        _store_pivot_offset_rig_space(settings_node, null_grp, locator_2)
 
     # =========================================================================
     # Delete the constraint
