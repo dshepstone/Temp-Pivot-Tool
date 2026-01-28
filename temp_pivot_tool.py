@@ -24,12 +24,10 @@ Features:
 - Auto-key: When you rotate locator_1, keyframes are automatically set on the control
 - Constraint-based alignment: Proper world-space alignment regardless of local space or parent hierarchy
 - Constraint validation: Warns if control has existing constraints that could cause double transforms
-- Stored pivot offset: The world-space offset between pivot and control is stored, ensuring
-  accurate realignment on toggle_on regardless of control rotation changes
 
 Author: David Shepstone
 License: MIT
-Version: 5.5.0
+Version: 5.4.1
 """
 
 from __future__ import annotations
@@ -203,13 +201,6 @@ def _add_bool_attr(node: str, attr: str, value: bool = False) -> None:
     """Add a boolean attribute if it doesn't exist."""
     if not cmds.attributeQuery(attr, node=node, exists=True):
         cmds.addAttr(node, longName=attr, attributeType="bool")
-    cmds.setAttr(f"{node}.{attr}", value)
-
-
-def _add_float_attr(node: str, attr: str, value: float = 0.0) -> None:
-    """Add a float attribute if it doesn't exist."""
-    if not cmds.attributeQuery(attr, node=node, exists=True):
-        cmds.addAttr(node, longName=attr, attributeType="double")
     cmds.setAttr(f"{node}.{attr}", value)
 
 
@@ -498,17 +489,6 @@ def complete_setup(locator_1: str) -> Tuple[bool, str, Optional[str]]:
     _add_string_attr(settings_node, "constraintName", constraint)
     _add_bool_attr(settings_node, "isActive", True)
 
-    # =========================================================================
-    # Store the world-space offset from control to pivot (locator_1)
-    # This is used by toggle_on to correctly realign the pivot position
-    # =========================================================================
-    control_pos = _get_world_position(control)
-    pivot_pos = _get_world_position(locator_1)
-    pivot_offset = [pivot_pos[i] - control_pos[i] for i in range(3)]
-    _add_float_attr(settings_node, "pivotOffsetX", pivot_offset[0])
-    _add_float_attr(settings_node, "pivotOffsetY", pivot_offset[1])
-    _add_float_attr(settings_node, "pivotOffsetZ", pivot_offset[2])
-
     # Parent settings under null_grp
     cmds.parent(settings_node, null_grp)
 
@@ -541,18 +521,13 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     Reactivate the temp pivot system.
 
     Process:
-    1. Get stored world-space pivot offset
-    2. Calculate target world position for locator_1 (pivot)
-    3. Match null_GRP to control's world position/rotation
-    4. Position locator_1 at calculated target world position
-    5. Reset locator_1's rotation to zero
-    6. Match locator_2 to control's world position
-    7. Recreate parentConstraint: locator_2 → control (maintainOffset)
-    8. Show visibility
+    1. Match null_GRP to control (realigns rig to control's current position)
+    2. Reset locator_1's LOCAL rotation to zero (preserve pivot offset translation)
+    3. Recreate parentConstraint: locator_2 → control (maintainOffset)
+    4. Show visibility
 
-    The key difference from previous approach: we use stored WORLD-SPACE offset
-    to explicitly calculate and set the pivot position, rather than relying on
-    preserved local transforms which break when null_GRP's rotation changes.
+    Note: locator_1's local translation (pivot offset) is PRESERVED.
+    Only the local rotation is reset so orbital rotation starts fresh.
 
     Args:
         settings_node: The settings node for this rig
@@ -582,52 +557,19 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         return False, "Locator_2 (driver) not found."
 
     # =========================================================================
-    # Get stored world-space pivot offset
-    # =========================================================================
-    has_offset = cmds.attributeQuery("pivotOffsetX", node=settings_node, exists=True)
-    if has_offset:
-        pivot_offset = [
-            cmds.getAttr(f"{settings_node}.pivotOffsetX"),
-            cmds.getAttr(f"{settings_node}.pivotOffsetY"),
-            cmds.getAttr(f"{settings_node}.pivotOffsetZ")
-        ]
-    else:
-        # Fallback for rigs created before this update: use zero offset
-        pivot_offset = [0.0, 0.0, 0.0]
-
-    # =========================================================================
-    # Calculate target world position for locator_1 (pivot)
-    # =========================================================================
-    control_pos = _get_world_position(control)
-    pivot_target_pos = [control_pos[i] + pivot_offset[i] for i in range(3)]
-
-    # =========================================================================
     # Match null_GRP to control's world position and rotation
+    # Using constraint-based matching for accurate world-space alignment
+    # regardless of the control's local space or parent hierarchy
     # =========================================================================
     _match_transform_world(null_grp, control)
 
     # =========================================================================
-    # Position locator_1 at calculated target world position
-    # Using temp locator and constraint for accurate world-space positioning
-    # This correctly sets locator_1's local transform under the rotated null_GRP
-    # =========================================================================
-    temp_target = cmds.spaceLocator(name="temp_pivot_target")[0]
-    cmds.xform(temp_target, worldSpace=True, translation=pivot_target_pos)
-    _match_translation_world(locator_1, temp_target)
-    cmds.delete(temp_target)
-
-    # =========================================================================
-    # Reset locator_1's rotation to zero (orbital rotation starts fresh)
+    # Reset locator_1's LOCAL rotation to zero (preserve pivot offset position)
+    # This resets the orbital rotation while maintaining the pivot point offset
     # =========================================================================
     cmds.setAttr(f"{locator_1}.rx", 0)
     cmds.setAttr(f"{locator_1}.ry", 0)
     cmds.setAttr(f"{locator_1}.rz", 0)
-
-    # =========================================================================
-    # Match locator_2 to control's current world position
-    # This ensures the driver is correctly positioned under the repositioned pivot
-    # =========================================================================
-    _match_transform_world(locator_2, control)
 
     # =========================================================================
     # Recreate parentConstraint: locator_2 → control
