@@ -27,7 +27,7 @@ Features:
 
 Author: David Shepstone
 License: MIT
-Version: 5.4.1
+Version: 5.6.0
 """
 
 from __future__ import annotations
@@ -201,6 +201,13 @@ def _add_bool_attr(node: str, attr: str, value: bool = False) -> None:
     """Add a boolean attribute if it doesn't exist."""
     if not cmds.attributeQuery(attr, node=node, exists=True):
         cmds.addAttr(node, longName=attr, attributeType="bool")
+    cmds.setAttr(f"{node}.{attr}", value)
+
+
+def _add_float_attr(node: str, attr: str, value: float = 0.0) -> None:
+    """Add a float attribute if it doesn't exist."""
+    if not cmds.attributeQuery(attr, node=node, exists=True):
+        cmds.addAttr(node, longName=attr, attributeType="double")
     cmds.setAttr(f"{node}.{attr}", value)
 
 
@@ -489,6 +496,16 @@ def complete_setup(locator_1: str) -> Tuple[bool, str, Optional[str]]:
     _add_string_attr(settings_node, "constraintName", constraint)
     _add_bool_attr(settings_node, "isActive", True)
 
+    # =========================================================================
+    # Store the world-space pivot offset (pivot position - control position)
+    # This offset is used by toggle_on to correctly reposition the pivot
+    # =========================================================================
+    control_world_pos = _get_world_position(control)
+    pivot_world_pos = _get_world_position(locator_1)
+    _add_float_attr(settings_node, "pivotOffsetX", pivot_world_pos[0] - control_world_pos[0])
+    _add_float_attr(settings_node, "pivotOffsetY", pivot_world_pos[1] - control_world_pos[1])
+    _add_float_attr(settings_node, "pivotOffsetZ", pivot_world_pos[2] - control_world_pos[2])
+
     # Parent settings under null_grp
     cmds.parent(settings_node, null_grp)
 
@@ -520,14 +537,19 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     """
     Reactivate the temp pivot system.
 
-    Process:
-    1. Match null_GRP to control (realigns rig to control's current position)
-    2. Reset locator_1's LOCAL rotation to zero (preserve pivot offset translation)
-    3. Recreate parentConstraint: locator_2 → control (maintainOffset)
-    4. Show visibility
+    NEW APPROACH - Identity rotation on null_GRP:
+    1. Get stored world-space pivot offset
+    2. Position null_GRP at control's position with ZERO rotation
+    3. Set locator_1's local translation to the stored offset (since null_GRP
+       has identity rotation, local space equals world space)
+    4. Reset locator_1's rotation to zero
+    5. Match locator_2 to control's current world transform
+    6. Recreate parentConstraint: locator_2 → control (maintainOffset)
+    7. Show visibility
 
-    Note: locator_1's local translation (pivot offset) is PRESERVED.
-    Only the local rotation is reset so orbital rotation starts fresh.
+    By keeping null_GRP at identity rotation, locator_1's local translation
+    directly equals the world-space offset from control to pivot. This avoids
+    the complexity of rotated parent coordinate systems.
 
     Args:
         settings_node: The settings node for this rig
@@ -557,19 +579,49 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         return False, "Locator_2 (driver) not found."
 
     # =========================================================================
-    # Match null_GRP to control's world position and rotation
-    # Using constraint-based matching for accurate world-space alignment
-    # regardless of the control's local space or parent hierarchy
+    # Get stored world-space pivot offset
     # =========================================================================
-    _match_transform_world(null_grp, control)
+    if cmds.attributeQuery("pivotOffsetX", node=settings_node, exists=True):
+        offset_x = cmds.getAttr(f"{settings_node}.pivotOffsetX")
+        offset_y = cmds.getAttr(f"{settings_node}.pivotOffsetY")
+        offset_z = cmds.getAttr(f"{settings_node}.pivotOffsetZ")
+    else:
+        # Fallback for rigs created before this update
+        offset_x = cmds.getAttr(f"{locator_1}.tx")
+        offset_y = cmds.getAttr(f"{locator_1}.ty")
+        offset_z = cmds.getAttr(f"{locator_1}.tz")
 
     # =========================================================================
-    # Reset locator_1's LOCAL rotation to zero (preserve pivot offset position)
-    # This resets the orbital rotation while maintaining the pivot point offset
+    # Position null_GRP at control's world position with IDENTITY rotation
+    # This is the key change: by keeping null_GRP at zero rotation,
+    # locator_1's local space is aligned with world space
+    # =========================================================================
+    control_pos = _get_world_position(control)
+    cmds.xform(null_grp, worldSpace=True, translation=control_pos)
+    cmds.setAttr(f"{null_grp}.rx", 0)
+    cmds.setAttr(f"{null_grp}.ry", 0)
+    cmds.setAttr(f"{null_grp}.rz", 0)
+
+    # =========================================================================
+    # Set locator_1's local translation to the stored world-space offset
+    # Since null_GRP has identity rotation, local offset = world offset
+    # =========================================================================
+    cmds.setAttr(f"{locator_1}.tx", offset_x)
+    cmds.setAttr(f"{locator_1}.ty", offset_y)
+    cmds.setAttr(f"{locator_1}.tz", offset_z)
+
+    # =========================================================================
+    # Reset locator_1's rotation to zero (orbital rotation starts fresh)
     # =========================================================================
     cmds.setAttr(f"{locator_1}.rx", 0)
     cmds.setAttr(f"{locator_1}.ry", 0)
     cmds.setAttr(f"{locator_1}.rz", 0)
+
+    # =========================================================================
+    # Match locator_2 to control's current world transform
+    # This positions the driver correctly under the repositioned pivot
+    # =========================================================================
+    _match_transform_world(locator_2, control)
 
     # =========================================================================
     # Recreate parentConstraint: locator_2 → control
