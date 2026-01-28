@@ -216,9 +216,19 @@ def _get_world_matrix(node: str) -> List[float]:
     return cmds.xform(node, q=True, ws=True, matrix=True)
 
 
+def _get_local_matrix(node: str) -> List[float]:
+    """Get local-space matrix as a 16-float list."""
+    return cmds.xform(node, q=True, matrix=True)
+
+
 def _set_world_matrix(node: str, matrix: List[float]) -> None:
     """Set world-space matrix from a 16-float list."""
     cmds.xform(node, ws=True, matrix=matrix)
+
+
+def _set_local_matrix(node: str, matrix: List[float]) -> None:
+    """Set local-space matrix from a 16-float list."""
+    cmds.xform(node, matrix=matrix)
 
 
 def _mmatrix_from_list(values: List[float]) -> om.MMatrix:
@@ -267,6 +277,32 @@ def _store_pivot_offset_rig_space(settings_node: str, null_grp: str, locator_2: 
     locator_world = _get_world_matrix(locator_2)
     pivot_offset = _multiply_matrices(_inverse_matrix(null_world), locator_world)
     _set_double_array_attr(settings_node, "pivotOffsetRigMtx", pivot_offset)
+
+
+def _store_pivot_local_matrices(settings_node: str, locator_1: str, locator_2: str) -> None:
+    """Store locator local matrices to preserve pivot offsets."""
+    loc1_local = _get_local_matrix(locator_1)
+    loc2_local = _get_local_matrix(locator_2)
+    _set_double_array_attr(settings_node, "pivotLoc1LocalMtx", loc1_local)
+    _set_double_array_attr(settings_node, "pivotLoc2LocalMtx", loc2_local)
+
+
+def _get_pivot_local_matrices(
+    settings_node: str,
+    locator_1: str,
+    locator_2: str
+) -> Tuple[List[float], List[float]]:
+    """Get stored local matrices or initialize them from current state."""
+    loc1_local = _get_double_array_attr(settings_node, "pivotLoc1LocalMtx")
+    loc2_local = _get_double_array_attr(settings_node, "pivotLoc2LocalMtx")
+    if loc1_local and len(loc1_local) == 16 and loc2_local and len(loc2_local) == 16:
+        return loc1_local, loc2_local
+
+    loc1_local = _get_local_matrix(locator_1)
+    loc2_local = _get_local_matrix(locator_2)
+    _set_double_array_attr(settings_node, "pivotLoc1LocalMtx", loc1_local)
+    _set_double_array_attr(settings_node, "pivotLoc2LocalMtx", loc2_local)
+    return loc1_local, loc2_local
 
 
 def _get_pivot_offset_rig_space(
@@ -571,6 +607,7 @@ def complete_setup(locator_1: str) -> Tuple[bool, str, Optional[str]]:
     _add_string_attr(settings_node, "constraintName", constraint)
     _add_bool_attr(settings_node, "isActive", True)
     _store_pivot_offset_rig_space(settings_node, null_grp, locator_2)
+    _store_pivot_local_matrices(settings_node, locator_1, locator_2)
 
     # Parent settings under null_grp
     cmds.parent(settings_node, null_grp)
@@ -651,11 +688,11 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     _set_world_matrix(null_grp, control_world)
 
     # =========================================================================
-    # Restore locator_2 from stored rig-space offset
+    # Restore locator local matrices to preserve pivot offsets
     # =========================================================================
-    pivot_offset = _get_pivot_offset_rig_space(settings_node, null_grp, locator_2)
-    locator2_world = _multiply_matrices(control_world, pivot_offset)
-    _set_world_matrix(locator_2, locator2_world)
+    loc1_local, loc2_local = _get_pivot_local_matrices(settings_node, locator_1, locator_2)
+    _set_local_matrix(locator_1, loc1_local)
+    _set_local_matrix(locator_2, loc2_local)
 
     # =========================================================================
     # Recreate parentConstraint: locator_2 → control
@@ -741,6 +778,8 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     # =========================================================================
     if null_grp and locator_2 and cmds.objExists(null_grp) and cmds.objExists(locator_2):
         _store_pivot_offset_rig_space(settings_node, null_grp, locator_2)
+    if locator_1 and locator_2 and cmds.objExists(locator_1) and cmds.objExists(locator_2):
+        _store_pivot_local_matrices(settings_node, locator_1, locator_2)
 
     # =========================================================================
     # Delete the constraint
