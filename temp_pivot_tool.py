@@ -27,7 +27,7 @@ Features:
 
 Author: David Shepstone
 License: MIT
-Version: 5.4.1
+Version: 5.5.0
 """
 
 from __future__ import annotations
@@ -521,13 +521,14 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     Reactivate the temp pivot system.
 
     Process:
-    1. Match null_GRP to control (realigns rig to control's current position)
-    2. Reset locator_1's LOCAL rotation to zero (preserve pivot offset translation)
+    1. Reset locator_1's LOCAL transform to zero (clears pivot offset)
+    2. Match null_GRP to control (realigns rig to control's current position)
     3. Recreate parentConstraint: locator_2 → control (maintainOffset)
     4. Show visibility
 
-    Note: locator_1's local translation (pivot offset) is PRESERVED.
-    Only the local rotation is reset so orbital rotation starts fresh.
+    Note: locator_1's local translation AND rotation are RESET to zero.
+    This ensures locator_2 properly aligns with the control's current position.
+    User can reposition the pivot after toggle ON if needed.
 
     Args:
         settings_node: The settings node for this rig
@@ -557,19 +558,23 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         return False, "Locator_2 (driver) not found."
 
     # =========================================================================
-    # Match null_GRP to control's world position and rotation
-    # Using constraint-based matching for accurate world-space alignment
-    # regardless of the control's local space or parent hierarchy
+    # Reset locator_1's LOCAL translation AND rotation to zero FIRST
+    # This clears any pivot offset so locator_2 will align with null_GRP
     # =========================================================================
-    _match_transform_world(null_grp, control)
-
-    # =========================================================================
-    # Reset locator_1's LOCAL rotation to zero (preserve pivot offset position)
-    # This resets the orbital rotation while maintaining the pivot point offset
-    # =========================================================================
+    cmds.setAttr(f"{locator_1}.tx", 0)
+    cmds.setAttr(f"{locator_1}.ty", 0)
+    cmds.setAttr(f"{locator_1}.tz", 0)
     cmds.setAttr(f"{locator_1}.rx", 0)
     cmds.setAttr(f"{locator_1}.ry", 0)
     cmds.setAttr(f"{locator_1}.rz", 0)
+
+    # =========================================================================
+    # Match null_GRP to control's world position and rotation
+    # Using constraint-based matching for accurate world-space alignment
+    # regardless of the control's local space or parent hierarchy
+    # Now locator_2 will be at control's position since locator_1 is at origin
+    # =========================================================================
+    _match_transform_world(null_grp, control)
 
     # =========================================================================
     # Recreate parentConstraint: locator_2 → control
