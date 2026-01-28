@@ -258,7 +258,7 @@ def _get_double_array_attr(node: str, attr: str) -> Optional[List[float]]:
 def _set_double_array_attr(node: str, attr: str, values: List[float]) -> None:
     """Set a doubleArray attribute from a list of floats."""
     _add_double_array_attr(node, attr)
-    cmds.setAttr(f"{node}.{attr}", len(values), *values, type="doubleArray")
+    cmds.setAttr(f"{node}.{attr}", values, type="doubleArray")
 
 
 def _store_pivot_offset_rig_space(settings_node: str, null_grp: str, locator_2: str) -> None:
