@@ -27,7 +27,7 @@ Features:
 
 Author: David Shepstone
 License: MIT
-Version: 5.4.1
+Version: 5.6.0
 """
 
 from __future__ import annotations
@@ -521,13 +521,14 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     Reactivate the temp pivot system.
 
     Process:
-    1. Match null_GRP to control (realigns rig to control's current position)
-    2. Reset locator_1's LOCAL rotation to zero (preserve pivot offset translation)
-    3. Recreate parentConstraint: locator_2 → control (maintainOffset)
-    4. Show visibility
+    1. Reset locator_1's rotation only (preserve pivot offset translation)
+    2. Match null_GRP to control (realigns rig to control position)
+    3. Match locator_2 to control's world position (recalculates local offset)
+    4. Recreate parentConstraint: locator_2 → control (maintainOffset)
+    5. Show visibility
 
-    Note: locator_1's local translation (pivot offset) is PRESERVED.
-    Only the local rotation is reset so orbital rotation starts fresh.
+    The pivot offset (locator_1's local translation) is PRESERVED.
+    locator_2 is realigned to the control's current world position.
 
     Args:
         settings_node: The settings node for this rig
@@ -557,19 +558,24 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         return False, "Locator_2 (driver) not found."
 
     # =========================================================================
-    # Match null_GRP to control's world position and rotation
-    # Using constraint-based matching for accurate world-space alignment
-    # regardless of the control's local space or parent hierarchy
-    # =========================================================================
-    _match_transform_world(null_grp, control)
-
-    # =========================================================================
-    # Reset locator_1's LOCAL rotation to zero (preserve pivot offset position)
-    # This resets the orbital rotation while maintaining the pivot point offset
+    # Reset locator_1's rotation only (preserve pivot offset translation)
+    # This keeps the pivot at its user-defined offset while resetting orbital rotation
     # =========================================================================
     cmds.setAttr(f"{locator_1}.rx", 0)
     cmds.setAttr(f"{locator_1}.ry", 0)
     cmds.setAttr(f"{locator_1}.rz", 0)
+
+    # =========================================================================
+    # Match null_GRP to control's world position and rotation
+    # =========================================================================
+    _match_transform_world(null_grp, control)
+
+    # =========================================================================
+    # Match locator_2 to control's world position and rotation
+    # This recalculates locator_2's local offset so it aligns with the control
+    # regardless of where locator_1 (pivot) is positioned
+    # =========================================================================
+    _match_transform_world(locator_2, control)
 
     # =========================================================================
     # Recreate parentConstraint: locator_2 → control
