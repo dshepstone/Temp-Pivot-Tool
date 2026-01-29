@@ -8,38 +8,36 @@ SIMPLIFIED WORKFLOW:
 2. Pivot mode activates - move the pivot to desired location
 3. Switch to Translate or Rotate tool - pivot mode exits, constraint created
 4. Manipulate control via the temp pivot
-5. Toggle OFF - keys the control, deletes constraint
+5. Toggle OFF - captures pivot offset, keys control, deletes pivot group
 6. Move control to new position
-7. Toggle ON - temp pivot realigns to control (pivot location preserved)
+7. Toggle ON - creates fresh pivot group, applies stored offset
 8. Repeat as needed
 
-Hierarchy Structure:
-    align_grp (realigns to control on toggle)
-      └── pivot_grp (user adjusts pivot here, constrains control)
-            └── settings node
+PIVOT OFFSET STORAGE:
+    The pivot offset (position relative to control in control's local space)
+    is stored as custom attributes on the control itself. This allows:
 
-ALIGNMENT METHODOLOGY (Constraint-Based Snap):
-    This tool uses constraint-based snapping instead of Maya's matchTransform
-    or direct xform world-space operations. The reason:
+    - Complete deletion of pivot groups on toggle OFF
+    - Fresh recreation on toggle ON with stored offset applied
+    - No complex realignment logic needed
+    - Clean, predictable behavior
 
-    - matchTransform/xform ws=True can rewrite local transform values in ways
-      that break expected parent-child offsets, especially in complex hierarchies.
-    - Constraint-based snap creates a temporary constraint (maintainOffset=False),
-      which "solves" the target's local matrix through its parent space, then
-      immediately deletes the constraint.
-    - This preserves the natural parent-child relationship and ensures children
-      follow correctly after the snap.
+Structure when active:
+    pivot_grp (user adjusts pivot here, constrains control)
+      └── settings node (temporary, deleted with group)
+
+    Control stores: pivotOffset[XYZ], pivotRotOffset[XYZ]
 
 Features:
-- Two-group hierarchy preserves pivot offset naturally
-- Constraint-based snap for reliable realignment
+- Store/restore pivot offset in control's local space
+- Fresh group creation avoids realignment issues
 - Auto pivot mode with smart exit detection
 - Auto-key on toggle off
 - Edit Temp Pivot button to adjust pivot location
 
 Author: David Shepstone
 License: MIT
-Version: 8.0.0
+Version: 9.0.0
 """
 
 from __future__ import annotations
@@ -57,10 +55,14 @@ WINDOW_TITLE = "Temp Pivot Tool"
 TOOL_PREFIX = "TMP"
 
 # Node naming convention
-ALIGN_GRP_SUFFIX = f"_{TOOL_PREFIX}_align"
 PIVOT_GRP_SUFFIX = f"_{TOOL_PREFIX}_pivot"
 SETTINGS_SUFFIX = f"_{TOOL_PREFIX}_settings"
 CONSTRAINT_SUFFIX = f"_{TOOL_PREFIX}_parentConstraint"
+
+# Pivot offset attribute names (stored on control)
+PIVOT_OFFSET_ATTRS = ["tmpPivotOffsetX", "tmpPivotOffsetY", "tmpPivotOffsetZ"]
+PIVOT_ROT_OFFSET_ATTRS = ["tmpPivotRotOffsetX", "tmpPivotRotOffsetY", "tmpPivotRotOffsetZ"]
+PIVOT_HAS_OFFSET_ATTR = "tmpPivotHasStoredOffset"
 
 # Pivot mode scriptJob storage
 _pivot_mode_jobs: Dict[str, int] = {}
@@ -90,10 +92,10 @@ TOOLTIPS = {
     ),
     "toggle_btn": (
         "Toggle the temp pivot ON/OFF.\n\n"
-        "OFF: Keys the control, deletes constraint.\n"
+        "OFF: Stores pivot offset, keys control, deletes pivot.\n"
         "     Move control to new position.\n\n"
-        "ON: Realigns pivot group to control position,\n"
-        "    recreates constraint. Pivot location preserved."
+        "ON: Creates fresh pivot at control's new position,\n"
+        "    applies stored offset. Pivot relationship preserved."
     ),
     "edit_pivot_btn": (
         "Edit the temp pivot location.\n\n"
@@ -102,7 +104,7 @@ TOOLTIPS = {
     ),
     "delete_btn": (
         "Delete the temp pivot rig completely.\n"
-        "Removes all rig nodes and cleans up constraints."
+        "Removes all rig nodes and clears stored offset."
     ),
     "select_pivot_btn": (
         "Select the temp pivot group.\n"
@@ -116,271 +118,231 @@ TOOLTIPS = {
 
 
 # =============================================================================
-# CONSTRAINT-BASED SNAP SYSTEM
+# PIVOT OFFSET STORAGE SYSTEM
 # =============================================================================
 #
-# WHY CONSTRAINT-BASED SNAP?
+# WHY DELETE AND RECREATE?
 #
-# Maya's matchTransform and xform(ws=True) commands perform a one-time
-# world-space "teleport" that directly overwrites local transform values.
-# This can break expected parent-child offsets because:
+# Previous versions attempted to realign existing groups when toggling ON.
+# This proved problematic because:
+# 1. Complex parent-child relationships and world-space transforms
+# 2. Accumulated drift across multiple toggles
+# 3. Constraint-based snap still didn't fully solve hierarchy issues
 #
-# 1. The local matrix is recomputed to achieve the world position, but this
-#    doesn't account for how the hierarchy should behave when the parent moves.
+# The new approach:
+# 1. On toggle OFF: Store pivot offset in control's local space, delete groups
+# 2. On toggle ON: Create fresh groups, apply stored offset
 #
-# 2. Children may not follow correctly because their relationship to the
-#    parent is effectively "baked out."
-#
-# The constraint-based approach:
-# 1. Creates a temporary constraint (parentConstraint or pointConstraint)
-# 2. Sets maintainOffset=False so the driven object snaps exactly to driver
-# 3. Maya's constraint system solves the driven object's local transform
-#    values through its parent hierarchy
-# 4. Immediately deletes the constraint
-#
-# Result: The local matrix is computed correctly relative to the parent,
-# so when the parent moves later, children follow as expected.
+# This is simpler and more reliable - no realignment needed.
 # =============================================================================
 
 
-def snap_transform(
-    driver: str,
-    driven: str,
-    mode: str = "parent",
-    translate: bool = True,
-    rotate: bool = True,
-    preserve_selection: bool = True,
-    use_undo_chunk: bool = True
-) -> Tuple[bool, str]:
+def get_pivot_offset_from_control(control: str, pivot_grp: str) -> Tuple[List[float], List[float]]:
     """
-    Snap driven object to driver using temporary constraint.
+    Calculate the pivot group's offset relative to the control in local space.
 
-    This is the core alignment function that replaces matchTransform/xform.
-    It uses constraints to properly solve local transforms through the
-    parent hierarchy, ensuring children follow correctly after snap.
+    This captures where the pivot is positioned relative to the control,
+    so we can recreate it at the same relative position later.
 
     Args:
-        driver: The object to snap TO (the target position)
-        driven: The object being snapped (will move to driver's position)
-        mode: "parent" for full transform, "point" for translation only,
-              "orient" for rotation only
-        translate: Whether to snap translation (used with mode="parent")
-        rotate: Whether to snap rotation (used with mode="parent")
-        preserve_selection: If True, restore original selection after snap
-        use_undo_chunk: If True, wrap in undo chunk for clean undo
+        control: The control object
+        pivot_grp: The pivot group
 
     Returns:
-        Tuple of (success, message)
-
-    Validation Tests:
-        1. Create rig, offset pivot, toggle OFF, move control, toggle ON
-           → align_grp snaps to control, pivot_grp retains local offset
-        2. After snap, moving control → hierarchy follows correctly
-        3. Repeated toggles do not accumulate drift
+        Tuple of (translation_offset, rotation_offset) in control's local space
     """
-    # Validate inputs
-    if not driver or not cmds.objExists(driver):
-        msg = f"Snap failed: driver '{driver}' does not exist."
-        cmds.warning(msg)
-        return False, msg
+    # Get world matrices
+    control_world_matrix = cmds.xform(control, q=True, matrix=True, worldSpace=True)
+    pivot_world_pos = cmds.xform(pivot_grp, q=True, translation=True, worldSpace=True)
+    pivot_world_rot = cmds.xform(pivot_grp, q=True, rotation=True, worldSpace=True)
 
-    if not driven or not cmds.objExists(driven):
-        msg = f"Snap failed: driven '{driven}' does not exist."
-        cmds.warning(msg)
-        return False, msg
+    # Get control's world position and rotation
+    control_world_pos = cmds.xform(control, q=True, translation=True, worldSpace=True)
+    control_world_rot = cmds.xform(control, q=True, rotation=True, worldSpace=True)
 
-    # Store original selection if needed
-    original_selection = None
-    if preserve_selection:
-        original_selection = cmds.ls(selection=True, long=True) or []
+    # Calculate offset in world space first
+    world_offset = [
+        pivot_world_pos[0] - control_world_pos[0],
+        pivot_world_pos[1] - control_world_pos[1],
+        pivot_world_pos[2] - control_world_pos[2]
+    ]
 
-    # Open undo chunk if requested
-    if use_undo_chunk:
-        cmds.undoInfo(openChunk=True, chunkName="snap_transform")
+    # Transform world offset into control's local space using inverse matrix
+    # For simplicity, we'll use a temporary locator approach
+    temp_loc = cmds.spaceLocator()[0]
+    cmds.xform(temp_loc, worldSpace=True, translation=pivot_world_pos)
+    cmds.xform(temp_loc, worldSpace=True, rotation=pivot_world_rot)
 
-    try:
-        # Check for locked channels and determine what we can snap
-        skip_translate = []
-        skip_rotate = []
+    # Parent to control to get local offset
+    cmds.parent(temp_loc, control)
+    local_offset = cmds.xform(temp_loc, q=True, translation=True, objectSpace=True)
+    local_rot_offset = cmds.xform(temp_loc, q=True, rotation=True, objectSpace=True)
 
-        # Check translate locks
-        for axis in ["x", "y", "z"]:
-            attr_path = f"{driven}.t{axis}"
-            if cmds.objExists(attr_path):
-                if cmds.getAttr(attr_path, lock=True):
-                    skip_translate.append(axis)
-                # Also check if connected (would fail constraint)
-                conns = cmds.listConnections(attr_path, source=True, destination=False) or []
-                if conns:
-                    skip_translate.append(axis)
+    cmds.delete(temp_loc)
 
-        # Check rotate locks
-        for axis in ["x", "y", "z"]:
-            attr_path = f"{driven}.r{axis}"
-            if cmds.objExists(attr_path):
-                if cmds.getAttr(attr_path, lock=True):
-                    skip_rotate.append(axis)
-                conns = cmds.listConnections(attr_path, source=True, destination=False) or []
-                if conns:
-                    skip_rotate.append(axis)
-
-        # Remove duplicates
-        skip_translate = list(set(skip_translate))
-        skip_rotate = list(set(skip_rotate))
-
-        # Determine if we can do any snapping
-        can_translate = translate and len(skip_translate) < 3
-        can_rotate = rotate and len(skip_rotate) < 3
-
-        if not can_translate and not can_rotate:
-            msg = f"Snap failed: all channels on '{driven}' are locked or connected."
-            cmds.warning(msg)
-            return False, msg
-
-        # Warn about partial snapping
-        if skip_translate or skip_rotate:
-            skipped = []
-            if skip_translate:
-                skipped.append(f"translate {skip_translate}")
-            if skip_rotate:
-                skipped.append(f"rotate {skip_rotate}")
-            cmds.warning(f"Snap: skipping locked/connected channels on '{driven}': {', '.join(skipped)}")
-
-        # Perform the constraint-based snap
-        constraint = None
-
-        if mode == "point" or (can_translate and not can_rotate):
-            # Point constraint for translation only
-            try:
-                constraint = cmds.pointConstraint(
-                    driver, driven,
-                    maintainOffset=False,
-                    skip=skip_translate if skip_translate else []
-                )[0]
-            except RuntimeError as e:
-                msg = f"Point constraint failed on '{driven}': {e}"
-                cmds.warning(msg)
-                return False, msg
-
-        elif mode == "orient" or (can_rotate and not can_translate):
-            # Orient constraint for rotation only
-            try:
-                constraint = cmds.orientConstraint(
-                    driver, driven,
-                    maintainOffset=False,
-                    skip=skip_rotate if skip_rotate else []
-                )[0]
-            except RuntimeError as e:
-                msg = f"Orient constraint failed on '{driven}': {e}"
-                cmds.warning(msg)
-                return False, msg
-
-        else:
-            # Parent constraint for full transform
-            try:
-                constraint = cmds.parentConstraint(
-                    driver, driven,
-                    maintainOffset=False,
-                    skipTranslate=skip_translate if skip_translate else [],
-                    skipRotate=skip_rotate if skip_rotate else []
-                )[0]
-            except RuntimeError as e:
-                msg = f"Parent constraint failed on '{driven}': {e}"
-                cmds.warning(msg)
-                return False, msg
-
-        # Immediately delete the constraint
-        if constraint and cmds.objExists(constraint):
-            cmds.delete(constraint)
-
-        return True, f"Snapped '{driven}' to '{driver}'"
-
-    except Exception as e:
-        msg = f"Snap failed with error: {e}"
-        cmds.warning(msg)
-        return False, msg
-
-    finally:
-        # Close undo chunk
-        if use_undo_chunk:
-            cmds.undoInfo(closeChunk=True)
-
-        # Restore selection
-        if preserve_selection and original_selection is not None:
-            try:
-                if original_selection:
-                    cmds.select(original_selection, replace=True)
-                else:
-                    cmds.select(clear=True)
-            except:
-                pass  # Selection restore is best-effort
+    return local_offset, local_rot_offset
 
 
-def get_local_transform(node: str) -> Dict[str, List[float]]:
+def store_pivot_offset_on_control(control: str, trans_offset: List[float], rot_offset: List[float]) -> bool:
     """
-    Get the local transform values of a node.
-
-    Returns a dictionary with translate, rotate, scale, and rotatePivot
-    in local space. This is used to store/restore pivot_grp's local
-    position relative to align_grp.
+    Store the pivot offset as custom attributes on the control.
 
     Args:
-        node: The node to query
-
-    Returns:
-        Dictionary with 'translate', 'rotate', 'scale', 'rotatePivot', 'scalePivot'
-    """
-    result = {
-        "translate": [0.0, 0.0, 0.0],
-        "rotate": [0.0, 0.0, 0.0],
-        "scale": [1.0, 1.0, 1.0],
-        "rotatePivot": [0.0, 0.0, 0.0],
-        "scalePivot": [0.0, 0.0, 0.0],
-    }
-
-    if not node or not cmds.objExists(node):
-        return result
-
-    try:
-        result["translate"] = cmds.xform(node, q=True, os=True, translation=True)
-        result["rotate"] = cmds.xform(node, q=True, os=True, rotation=True)
-        result["scale"] = cmds.xform(node, q=True, os=True, scale=True)
-        result["rotatePivot"] = cmds.xform(node, q=True, os=True, rotatePivot=True)
-        result["scalePivot"] = cmds.xform(node, q=True, os=True, scalePivot=True)
-    except:
-        pass
-
-    return result
-
-
-def set_local_transform(node: str, transform_data: Dict[str, List[float]]) -> bool:
-    """
-    Set the local transform values of a node.
-
-    Args:
-        node: The node to set transforms on
-        transform_data: Dictionary from get_local_transform()
+        control: The control to store offset on
+        trans_offset: Translation offset [x, y, z]
+        rot_offset: Rotation offset [x, y, z]
 
     Returns:
         True if successful
     """
-    if not node or not cmds.objExists(node):
+    if not control or not cmds.objExists(control):
         return False
 
     try:
-        if "translate" in transform_data:
-            cmds.xform(node, os=True, translation=transform_data["translate"])
-        if "rotate" in transform_data:
-            cmds.xform(node, os=True, rotation=transform_data["rotate"])
-        if "scale" in transform_data:
-            cmds.xform(node, os=True, scale=transform_data["scale"])
-        if "rotatePivot" in transform_data:
-            cmds.xform(node, os=True, rotatePivot=transform_data["rotatePivot"])
-        if "scalePivot" in transform_data:
-            cmds.xform(node, os=True, scalePivot=transform_data["scalePivot"])
+        # Add translation offset attributes
+        for i, attr_name in enumerate(PIVOT_OFFSET_ATTRS):
+            if not cmds.attributeQuery(attr_name, node=control, exists=True):
+                cmds.addAttr(control, longName=attr_name, attributeType="float", defaultValue=0.0)
+            cmds.setAttr(f"{control}.{attr_name}", trans_offset[i])
+
+        # Add rotation offset attributes
+        for i, attr_name in enumerate(PIVOT_ROT_OFFSET_ATTRS):
+            if not cmds.attributeQuery(attr_name, node=control, exists=True):
+                cmds.addAttr(control, longName=attr_name, attributeType="float", defaultValue=0.0)
+            cmds.setAttr(f"{control}.{attr_name}", rot_offset[i])
+
+        # Mark that we have stored offset
+        if not cmds.attributeQuery(PIVOT_HAS_OFFSET_ATTR, node=control, exists=True):
+            cmds.addAttr(control, longName=PIVOT_HAS_OFFSET_ATTR, attributeType="bool", defaultValue=False)
+        cmds.setAttr(f"{control}.{PIVOT_HAS_OFFSET_ATTR}", True)
+
         return True
+
     except Exception as e:
-        cmds.warning(f"Failed to set local transform on '{node}': {e}")
+        cmds.warning(f"Failed to store pivot offset on '{control}': {e}")
+        return False
+
+
+def get_stored_pivot_offset(control: str) -> Tuple[Optional[List[float]], Optional[List[float]]]:
+    """
+    Retrieve stored pivot offset from control's custom attributes.
+
+    Args:
+        control: The control to read offset from
+
+    Returns:
+        Tuple of (translation_offset, rotation_offset) or (None, None) if not stored
+    """
+    if not control or not cmds.objExists(control):
+        return None, None
+
+    # Check if offset is stored
+    if not cmds.attributeQuery(PIVOT_HAS_OFFSET_ATTR, node=control, exists=True):
+        return None, None
+    if not cmds.getAttr(f"{control}.{PIVOT_HAS_OFFSET_ATTR}"):
+        return None, None
+
+    try:
+        trans_offset = []
+        for attr_name in PIVOT_OFFSET_ATTRS:
+            if cmds.attributeQuery(attr_name, node=control, exists=True):
+                trans_offset.append(cmds.getAttr(f"{control}.{attr_name}"))
+            else:
+                return None, None
+
+        rot_offset = []
+        for attr_name in PIVOT_ROT_OFFSET_ATTRS:
+            if cmds.attributeQuery(attr_name, node=control, exists=True):
+                rot_offset.append(cmds.getAttr(f"{control}.{attr_name}"))
+            else:
+                return None, None
+
+        return trans_offset, rot_offset
+
+    except Exception as e:
+        cmds.warning(f"Failed to read pivot offset from '{control}': {e}")
+        return None, None
+
+
+def has_stored_pivot_offset(control: str) -> bool:
+    """Check if a control has a stored pivot offset."""
+    if not control or not cmds.objExists(control):
+        return False
+    if not cmds.attributeQuery(PIVOT_HAS_OFFSET_ATTR, node=control, exists=True):
+        return False
+    return cmds.getAttr(f"{control}.{PIVOT_HAS_OFFSET_ATTR}")
+
+
+def clear_pivot_offset_from_control(control: str) -> bool:
+    """
+    Clear stored pivot offset from control (but keep attributes for reuse).
+
+    Args:
+        control: The control to clear offset from
+
+    Returns:
+        True if successful
+    """
+    if not control or not cmds.objExists(control):
+        return False
+
+    try:
+        if cmds.attributeQuery(PIVOT_HAS_OFFSET_ATTR, node=control, exists=True):
+            cmds.setAttr(f"{control}.{PIVOT_HAS_OFFSET_ATTR}", False)
+        return True
+    except:
+        return False
+
+
+def apply_pivot_offset_to_group(control: str, pivot_grp: str, trans_offset: List[float], rot_offset: List[float]) -> bool:
+    """
+    Apply stored offset to position pivot_grp relative to control.
+
+    Creates a temporary parent relationship to apply local offset,
+    then unparents.
+
+    Args:
+        control: The control (reference for local space)
+        pivot_grp: The pivot group to position
+        trans_offset: Translation offset in control's local space
+        rot_offset: Rotation offset in control's local space
+
+    Returns:
+        True if successful
+    """
+    if not control or not cmds.objExists(control):
+        return False
+    if not pivot_grp or not cmds.objExists(pivot_grp):
+        return False
+
+    try:
+        # First, align pivot_grp to control's world position/rotation
+        control_world_pos = cmds.xform(control, q=True, translation=True, worldSpace=True)
+        control_world_rot = cmds.xform(control, q=True, rotation=True, worldSpace=True)
+        cmds.xform(pivot_grp, worldSpace=True, translation=control_world_pos)
+        cmds.xform(pivot_grp, worldSpace=True, rotation=control_world_rot)
+
+        # Parent pivot_grp under control temporarily to apply local offset
+        original_parent = cmds.listRelatives(pivot_grp, parent=True)
+        cmds.parent(pivot_grp, control)
+
+        # Apply local offset
+        cmds.xform(pivot_grp, objectSpace=True, translation=trans_offset)
+        cmds.xform(pivot_grp, objectSpace=True, rotation=rot_offset)
+
+        # Unparent back to world (or original parent)
+        cmds.parent(pivot_grp, world=True)
+
+        return True
+
+    except Exception as e:
+        cmds.warning(f"Failed to apply pivot offset: {e}")
+        # Try to recover
+        try:
+            if cmds.listRelatives(pivot_grp, parent=True):
+                cmds.parent(pivot_grp, world=True)
+        except:
+            pass
         return False
 
 
@@ -480,7 +442,6 @@ def get_rig_nodes(settings_node: str) -> Dict[str, Optional[str]]:
     """Get all rig node names from a settings node."""
     result = {
         "settings": settings_node,
-        "align_grp": None,
         "pivot_grp": None,
         "control": None,
         "constraint": None,
@@ -489,8 +450,6 @@ def get_rig_nodes(settings_node: str) -> Dict[str, Optional[str]]:
     if not cmds.objExists(settings_node):
         return result
 
-    if cmds.attributeQuery("alignGrp", node=settings_node, exists=True):
-        result["align_grp"] = cmds.getAttr(f"{settings_node}.alignGrp") or None
     if cmds.attributeQuery("pivotGrp", node=settings_node, exists=True):
         result["pivot_grp"] = cmds.getAttr(f"{settings_node}.pivotGrp") or None
     if cmds.attributeQuery("targetControl", node=settings_node, exists=True):
@@ -535,7 +494,6 @@ def enter_pivot_mode(settings_node: str) -> Tuple[bool, str]:
 
     nodes = get_rig_nodes(settings_node)
     pivot_grp = nodes["pivot_grp"]
-    align_grp = nodes["align_grp"]
 
     if not pivot_grp or not cmds.objExists(pivot_grp):
         return False, "Pivot group not found."
@@ -562,9 +520,8 @@ def enter_pivot_mode(settings_node: str) -> Tuple[bool, str]:
     # Update visual feedback - orange color for pivot mode
     _update_pivot_visual(pivot_grp, "pivot_mode")
 
-    # Make sure align_grp is visible during pivot editing
-    if align_grp and cmds.objExists(align_grp):
-        cmds.setAttr(f"{align_grp}.visibility", 1)
+    # Make sure pivot_grp is visible during pivot editing
+    cmds.setAttr(f"{pivot_grp}.visibility", 1)
 
     return True, "Pivot mode active. Move the pivot, then switch to Translate/Rotate to apply."
 
@@ -689,17 +646,15 @@ def create_temp_pivot(control: str) -> Tuple[bool, str, Optional[str]]:
     """
     Create a temp pivot at the selected control.
 
-    Creates two groups:
-    - align_grp: Parent group that realigns to control on toggle
-    - pivot_grp: Child group where user adjusts pivot, constrains control
+    Creates a single pivot_grp at the control's position.
+    User moves the pivot, then on exit from pivot mode, constraint is created.
 
-    Hierarchy:
-        align_grp (realigns to control)
-          └── pivot_grp (user moves pivot here)
-                └── settings node
+    Structure:
+        pivot_grp (in world space, user moves pivot here)
+          └── settings node
 
-    Uses constraint-based snap for initial alignment to ensure proper
-    local transform values that will behave correctly in the hierarchy.
+    The pivot offset is stored on the control itself for persistence
+    across toggle off/on cycles.
 
     Args:
         control: The control to create a temp pivot for
@@ -727,32 +682,15 @@ def create_temp_pivot(control: str) -> Tuple[bool, str, Optional[str]]:
     prefix = _sanitize_name(control)
 
     # =========================================================================
-    # Create align_grp (parent - this realigns to control on toggle)
-    # =========================================================================
-    align_grp = cmds.group(empty=True, name=f"{prefix}{ALIGN_GRP_SUFFIX}")
-
-    # Use constraint-based snap to align to control
-    success, msg = snap_transform(control, align_grp, mode="parent", use_undo_chunk=False)
-    if not success:
-        cmds.delete(align_grp)
-        return False, f"Failed to create temp pivot: {msg}", None
-
-    # =========================================================================
-    # Create pivot_grp (child - user adjusts pivot here)
+    # Create pivot_grp at control's world position/rotation
     # =========================================================================
     pivot_grp = cmds.group(empty=True, name=f"{prefix}{PIVOT_GRP_SUFFIX}")
 
-    # Snap to control position before parenting
-    success, msg = snap_transform(control, pivot_grp, mode="parent", use_undo_chunk=False)
-    if not success:
-        cmds.delete(align_grp)
-        cmds.delete(pivot_grp)
-        return False, f"Failed to create temp pivot: {msg}", None
-
-    # Parent pivot_grp under align_grp
-    # After parenting, pivot_grp's local transform should be identity (0,0,0)
-    # because both were snapped to the same position
-    cmds.parent(pivot_grp, align_grp)
+    # Match control's world position and rotation
+    control_world_pos = cmds.xform(control, q=True, translation=True, worldSpace=True)
+    control_world_rot = cmds.xform(control, q=True, rotation=True, worldSpace=True)
+    cmds.xform(pivot_grp, worldSpace=True, translation=control_world_pos)
+    cmds.xform(pivot_grp, worldSpace=True, rotation=control_world_rot)
 
     # Add a locator shape for visibility
     loc = cmds.spaceLocator()[0]
@@ -804,7 +742,6 @@ def create_temp_pivot(control: str) -> Tuple[bool, str, Optional[str]]:
 
     # Store references
     _add_string_attr(settings_node, "targetControl", control)
-    _add_string_attr(settings_node, "alignGrp", align_grp)
     _add_string_attr(settings_node, "pivotGrp", pivot_grp)
     _add_string_attr(settings_node, "constraintName", "")
     _add_bool_attr(settings_node, "isActive", False)
@@ -829,24 +766,19 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     """
     Reactivate the temp pivot system.
 
+    NEW APPROACH (v9.0.0):
+    Since toggle_off now deletes the pivot group entirely, toggle_on must
+    recreate it fresh. The pivot offset is stored on the control itself.
+
     Process:
-    1. Store pivot_grp's local transform (the pivot offset relative to align_grp)
-    2. Snap align_grp to the control's current world position using constraint
-    3. Restore pivot_grp's local transform (maintains pivot offset)
+    1. Read stored pivot offset from control's custom attributes
+    2. Create fresh pivot_grp at control's current position
+    3. Apply stored offset to position pivot_grp
     4. Create parentConstraint: pivot_grp → control
-
-    The constraint-based snap ensures align_grp's local values are computed
-    correctly through its parent hierarchy. The pivot offset is preserved
-    because we store and restore pivot_grp's LOCAL transform, not world.
-
-    Validation Tests:
-        1. Create rig, offset pivot, toggle OFF, move control, toggle ON
-           → align_grp snaps to control, pivot_grp retains rig-space offset
-        2. After toggle ON, moving control → children follow correctly
-        3. Repeated toggles do not drift or accumulate error
+    5. Move settings node under new pivot_grp
 
     Args:
-        settings_node: The settings node for this rig
+        settings_node: The settings node for this rig (may be orphaned)
 
     Returns:
         Tuple of (success, message)
@@ -859,48 +791,91 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
 
     nodes = get_rig_nodes(settings_node)
     control = nodes["control"]
-    align_grp = nodes["align_grp"]
-    pivot_grp = nodes["pivot_grp"]
 
     if not control or not cmds.objExists(control):
         return False, f"Control '{control}' not found."
-    if not align_grp or not cmds.objExists(align_grp):
-        return False, "Align group not found."
-    if not pivot_grp or not cmds.objExists(pivot_grp):
-        return False, "Pivot group not found."
 
     # =========================================================================
-    # Store pivot_grp's local transform BEFORE snapping align_grp
-    # This is the "pivot offset" - the user-defined pivot position relative
-    # to where the align_grp is positioned.
+    # Get stored pivot offset from control
     # =========================================================================
-    pivot_local_transform = get_local_transform(pivot_grp)
+    trans_offset, rot_offset = get_stored_pivot_offset(control)
+
+    if trans_offset is None or rot_offset is None:
+        return False, "No stored pivot offset found. Create a new temp pivot."
 
     # =========================================================================
-    # Snap align_grp to the control's world position using constraint
-    # This properly solves the local matrix through parent hierarchy
+    # Create fresh pivot_grp at control's current position
     # =========================================================================
-    success, msg = snap_transform(
-        control, align_grp,
-        mode="parent",
-        preserve_selection=True,
-        use_undo_chunk=False
-    )
+    prefix = _sanitize_name(control)
+    pivot_grp = cmds.group(empty=True, name=f"{prefix}{PIVOT_GRP_SUFFIX}")
 
+    # Match control's world position and rotation
+    control_world_pos = cmds.xform(control, q=True, translation=True, worldSpace=True)
+    control_world_rot = cmds.xform(control, q=True, rotation=True, worldSpace=True)
+    cmds.xform(pivot_grp, worldSpace=True, translation=control_world_pos)
+    cmds.xform(pivot_grp, worldSpace=True, rotation=control_world_rot)
+
+    # Add visual elements
+    loc = cmds.spaceLocator()[0]
+    loc_shape = cmds.listRelatives(loc, shapes=True)[0]
+    cmds.parent(loc_shape, pivot_grp, shape=True, relative=True)
+    cmds.delete(loc)
+
+    # Style the locator
+    shapes = cmds.listRelatives(pivot_grp, shapes=True) or []
+    for shape in shapes:
+        if cmds.nodeType(shape) == "locator":
+            cmds.setAttr(f"{shape}.overrideEnabled", 1)
+            cmds.setAttr(f"{shape}.overrideRGBColors", 1)
+            cmds.setAttr(f"{shape}.overrideColorR", UI_COLORS["on_state"][0])
+            cmds.setAttr(f"{shape}.overrideColorG", UI_COLORS["on_state"][1])
+            cmds.setAttr(f"{shape}.overrideColorB", UI_COLORS["on_state"][2])
+            cmds.setAttr(f"{shape}.localScaleX", 0.5)
+            cmds.setAttr(f"{shape}.localScaleY", 0.5)
+            cmds.setAttr(f"{shape}.localScaleZ", 0.5)
+
+    # Add visual rings
+    for axis, color, normal in [
+        ("X", (1, 0.3, 0.3), (1, 0, 0)),
+        ("Y", (0.3, 1, 0.3), (0, 1, 0)),
+        ("Z", (0.3, 0.5, 1), (0, 0, 1))
+    ]:
+        circle = cmds.circle(
+            name=f"{prefix}{PIVOT_GRP_SUFFIX}_ring{axis}",
+            normal=normal,
+            radius=0.6,
+            degree=3,
+            sections=24,
+            constructionHistory=False
+        )[0]
+        circle_shape = cmds.listRelatives(circle, shapes=True)[0]
+        cmds.setAttr(f"{circle_shape}.overrideEnabled", 1)
+        cmds.setAttr(f"{circle_shape}.overrideRGBColors", 1)
+        cmds.setAttr(f"{circle_shape}.overrideColorR", color[0])
+        cmds.setAttr(f"{circle_shape}.overrideColorG", color[1])
+        cmds.setAttr(f"{circle_shape}.overrideColorB", color[2])
+        cmds.parent(circle_shape, pivot_grp, shape=True, relative=True)
+        cmds.delete(circle)
+
+    # =========================================================================
+    # Apply stored offset to position pivot_grp
+    # =========================================================================
+    success = apply_pivot_offset_to_group(control, pivot_grp, trans_offset, rot_offset)
     if not success:
-        return False, f"Failed to realign temp pivot: {msg}"
+        cmds.delete(pivot_grp)
+        return False, "Failed to apply stored pivot offset."
 
     # =========================================================================
-    # Restore pivot_grp's local transform
-    # Because we're setting LOCAL values (not world), the pivot stays at
-    # the same offset relative to align_grp's new position
+    # Update settings node
     # =========================================================================
-    set_local_transform(pivot_grp, pivot_local_transform)
+    cmds.setAttr(f"{settings_node}.pivotGrp", pivot_grp, type="string")
+
+    # Parent settings under new pivot_grp
+    cmds.parent(settings_node, pivot_grp)
 
     # =========================================================================
     # Create parentConstraint: pivot_grp → control
     # =========================================================================
-    prefix = _sanitize_name(control)
     constraint_name = f"{prefix}{CONSTRAINT_SUFFIX}"
 
     if cmds.objExists(constraint_name):
@@ -915,11 +890,6 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     # Update settings
     cmds.setAttr(f"{settings_node}.constraintName", constraint, type="string")
     cmds.setAttr(f"{settings_node}.isActive", True)
-
-    # =========================================================================
-    # Show visibility
-    # =========================================================================
-    cmds.setAttr(f"{align_grp}.visibility", 1)
 
     # Update visual - green for active
     _update_pivot_visual(pivot_grp, "on_state")
@@ -941,10 +911,15 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     """
     Deactivate the temp pivot system.
 
+    NEW APPROACH (v9.0.0):
+    Instead of hiding the pivot group, we store the offset and delete it.
+    This avoids all realignment issues on toggle_on.
+
     Process:
-    1. Key the control at current position
-    2. Delete the constraint
-    3. Hide the align group (and children)
+    1. Store pivot offset in control's local space
+    2. Key the control at current position
+    3. Delete the constraint
+    4. Delete the pivot group entirely (settings node moves to world)
 
     Args:
         settings_node: The settings node for this rig
@@ -961,8 +936,10 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     nodes = get_rig_nodes(settings_node)
     control = nodes["control"]
     constraint = nodes["constraint"]
-    align_grp = nodes["align_grp"]
     pivot_grp = nodes["pivot_grp"]
+
+    if not control or not cmds.objExists(control):
+        return False, f"Control '{control}' not found."
 
     # =========================================================================
     # Clean up auto-key scriptJobs
@@ -970,10 +947,17 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     cleanup_auto_key(settings_node)
 
     # =========================================================================
+    # Store pivot offset BEFORE deleting anything
+    # This captures the pivot's position relative to control in local space
+    # =========================================================================
+    if pivot_grp and cmds.objExists(pivot_grp):
+        trans_offset, rot_offset = get_pivot_offset_from_control(control, pivot_grp)
+        store_pivot_offset_on_control(control, trans_offset, rot_offset)
+
+    # =========================================================================
     # KEY THE CONTROL before deleting constraint
     # =========================================================================
-    if control and cmds.objExists(control):
-        key_control(settings_node)
+    key_control(settings_node)
 
     # =========================================================================
     # Delete the constraint
@@ -982,27 +966,31 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
         cmds.delete(constraint)
 
     # Also clean any other constraints from this tool
-    if control and cmds.objExists(control):
-        constraints = cmds.listRelatives(control, type="parentConstraint") or []
-        for c in constraints:
-            if CONSTRAINT_SUFFIX in c or TOOL_PREFIX in c:
-                cmds.delete(c)
+    constraints = cmds.listRelatives(control, type="parentConstraint") or []
+    for c in constraints:
+        if CONSTRAINT_SUFFIX in c or TOOL_PREFIX in c:
+            cmds.delete(c)
 
-    # Clear constraint reference and set inactive
+    # =========================================================================
+    # Unparent settings node before deleting pivot_grp
+    # =========================================================================
+    cmds.parent(settings_node, world=True)
+    cmds.setAttr(f"{settings_node}.visibility", 0)
+
+    # =========================================================================
+    # Delete the pivot group entirely
+    # =========================================================================
+    if pivot_grp and cmds.objExists(pivot_grp):
+        cmds.delete(pivot_grp)
+
+    # =========================================================================
+    # Update settings
+    # =========================================================================
     cmds.setAttr(f"{settings_node}.constraintName", "", type="string")
+    cmds.setAttr(f"{settings_node}.pivotGrp", "", type="string")
     cmds.setAttr(f"{settings_node}.isActive", False)
 
-    # =========================================================================
-    # Hide visibility
-    # =========================================================================
-    if align_grp and cmds.objExists(align_grp):
-        cmds.setAttr(f"{align_grp}.visibility", 0)
-
-    # Update visual - orange for inactive
-    if pivot_grp and cmds.objExists(pivot_grp):
-        _update_pivot_visual(pivot_grp, "pivot_mode")
-
-    return True, f"Pivot OFF. '{control}' keyed at current position."
+    return True, f"Pivot OFF. '{control}' keyed. Pivot offset stored."
 
 
 # =============================================================================
@@ -1163,20 +1151,17 @@ def delete_pivot_rig(settings_node: str) -> Tuple[bool, str]:
     cleanup_auto_key(settings_node)
     _cleanup_pivot_mode_monitor(settings_node)
 
-    # Toggle off first if active
-    if is_rig_active(settings_node):
-        toggle_off(settings_node)
+    # Delete constraint first
+    constraint = nodes["constraint"]
+    if constraint and cmds.objExists(constraint):
+        cmds.delete(constraint)
 
-    # Delete align_grp (deletes pivot_grp and settings node too since they're children)
-    align_grp = nodes["align_grp"]
-    if align_grp and cmds.objExists(align_grp):
-        cmds.delete(align_grp)
-
-    # Clean up any orphaned nodes
+    # Delete pivot_grp (and settings node if parented under it)
     pivot_grp = nodes["pivot_grp"]
     if pivot_grp and cmds.objExists(pivot_grp):
         cmds.delete(pivot_grp)
 
+    # Delete settings node if it still exists (might be orphaned)
     if cmds.objExists(settings_node):
         cmds.delete(settings_node)
 
@@ -1186,6 +1171,10 @@ def delete_pivot_rig(settings_node: str) -> Tuple[bool, str]:
         for c in constraints:
             if CONSTRAINT_SUFFIX in c or TOOL_PREFIX in c:
                 cmds.delete(c)
+
+    # Clear stored pivot offset from control
+    if control and cmds.objExists(control):
+        clear_pivot_offset_from_control(control)
 
     return True, f"Deleted temp pivot for '{control}'."
 
@@ -1524,13 +1513,6 @@ def show() -> None:
                 if cmds.objExists(possible_settings):
                     selected_settings = possible_settings
                 break
-            # Check for align group
-            if ALIGN_GRP_SUFFIX in item:
-                prefix = item.replace(ALIGN_GRP_SUFFIX, "")
-                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                if cmds.objExists(possible_settings):
-                    selected_settings = possible_settings
-                break
             # Check if it's a control with a rig
             rig = get_rig_for_control(item)
             if rig:
@@ -1562,11 +1544,6 @@ def show() -> None:
         for item in sel:
             if PIVOT_GRP_SUFFIX in item:
                 prefix = item.replace(PIVOT_GRP_SUFFIX, "")
-                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                if cmds.objExists(possible_settings):
-                    return ("rig", possible_settings)
-            if ALIGN_GRP_SUFFIX in item:
-                prefix = item.replace(ALIGN_GRP_SUFFIX, "")
                 possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
                 if cmds.objExists(possible_settings):
                     return ("rig", possible_settings)
