@@ -144,6 +144,12 @@ def get_pivot_offset_from_control(control: str, pivot_grp: str) -> Tuple[List[fl
     This captures where the pivot is positioned relative to the control,
     so we can recreate it at the same relative position later.
 
+    Process:
+    1. Create a temporary locator at pivot's world position/rotation
+    2. Parent it to control (Maya computes local transform to maintain world pos)
+    3. Read the local translate/rotate attributes directly
+    4. Delete temp locator
+
     Args:
         control: The control object
         pivot_grp: The pivot group
@@ -151,32 +157,29 @@ def get_pivot_offset_from_control(control: str, pivot_grp: str) -> Tuple[List[fl
     Returns:
         Tuple of (translation_offset, rotation_offset) in control's local space
     """
-    # Get world matrices
-    control_world_matrix = cmds.xform(control, q=True, matrix=True, worldSpace=True)
+    # Get pivot's world position and rotation
     pivot_world_pos = cmds.xform(pivot_grp, q=True, translation=True, worldSpace=True)
     pivot_world_rot = cmds.xform(pivot_grp, q=True, rotation=True, worldSpace=True)
 
-    # Get control's world position and rotation
-    control_world_pos = cmds.xform(control, q=True, translation=True, worldSpace=True)
-    control_world_rot = cmds.xform(control, q=True, rotation=True, worldSpace=True)
-
-    # Calculate offset in world space first
-    world_offset = [
-        pivot_world_pos[0] - control_world_pos[0],
-        pivot_world_pos[1] - control_world_pos[1],
-        pivot_world_pos[2] - control_world_pos[2]
-    ]
-
-    # Transform world offset into control's local space using inverse matrix
-    # For simplicity, we'll use a temporary locator approach
+    # Create temp locator at pivot's world position/rotation
     temp_loc = cmds.spaceLocator()[0]
     cmds.xform(temp_loc, worldSpace=True, translation=pivot_world_pos)
     cmds.xform(temp_loc, worldSpace=True, rotation=pivot_world_rot)
 
-    # Parent to control to get local offset
+    # Parent to control - Maya computes local transform to maintain world position
     cmds.parent(temp_loc, control)
-    local_offset = cmds.xform(temp_loc, q=True, translation=True, objectSpace=True)
-    local_rot_offset = cmds.xform(temp_loc, q=True, rotation=True, objectSpace=True)
+
+    # Read local transform attributes directly (more reliable than xform objectSpace)
+    local_offset = [
+        cmds.getAttr(f"{temp_loc}.translateX"),
+        cmds.getAttr(f"{temp_loc}.translateY"),
+        cmds.getAttr(f"{temp_loc}.translateZ")
+    ]
+    local_rot_offset = [
+        cmds.getAttr(f"{temp_loc}.rotateX"),
+        cmds.getAttr(f"{temp_loc}.rotateY"),
+        cmds.getAttr(f"{temp_loc}.rotateZ")
+    ]
 
     cmds.delete(temp_loc)
 
@@ -298,8 +301,14 @@ def apply_pivot_offset_to_group(control: str, pivot_grp: str, trans_offset: List
     """
     Apply stored offset to position pivot_grp relative to control.
 
-    Creates a temporary parent relationship to apply local offset,
-    then unparents.
+    Process:
+    1. Parent pivot_grp to control
+    2. Reset local transform to identity (0,0,0)
+    3. Set local transform to stored offset using direct setAttr
+    4. Unparent back to world
+
+    Using setAttr directly on translate/rotate attributes is more reliable
+    than xform objectSpace, which can have issues with rotation.
 
     Args:
         control: The control (reference for local space)
@@ -316,21 +325,27 @@ def apply_pivot_offset_to_group(control: str, pivot_grp: str, trans_offset: List
         return False
 
     try:
-        # First, align pivot_grp to control's world position/rotation
-        control_world_pos = cmds.xform(control, q=True, translation=True, worldSpace=True)
-        control_world_rot = cmds.xform(control, q=True, rotation=True, worldSpace=True)
-        cmds.xform(pivot_grp, worldSpace=True, translation=control_world_pos)
-        cmds.xform(pivot_grp, worldSpace=True, rotation=control_world_rot)
-
-        # Parent pivot_grp under control temporarily to apply local offset
-        original_parent = cmds.listRelatives(pivot_grp, parent=True)
+        # Parent pivot_grp under control
         cmds.parent(pivot_grp, control)
 
-        # Apply local offset
-        cmds.xform(pivot_grp, objectSpace=True, translation=trans_offset)
-        cmds.xform(pivot_grp, objectSpace=True, rotation=rot_offset)
+        # Reset local transform to identity first
+        # This ensures we start from a clean state regardless of current position
+        cmds.setAttr(f"{pivot_grp}.translateX", 0)
+        cmds.setAttr(f"{pivot_grp}.translateY", 0)
+        cmds.setAttr(f"{pivot_grp}.translateZ", 0)
+        cmds.setAttr(f"{pivot_grp}.rotateX", 0)
+        cmds.setAttr(f"{pivot_grp}.rotateY", 0)
+        cmds.setAttr(f"{pivot_grp}.rotateZ", 0)
 
-        # Unparent back to world (or original parent)
+        # Apply the stored offset by setting local transform attributes directly
+        cmds.setAttr(f"{pivot_grp}.translateX", trans_offset[0])
+        cmds.setAttr(f"{pivot_grp}.translateY", trans_offset[1])
+        cmds.setAttr(f"{pivot_grp}.translateZ", trans_offset[2])
+        cmds.setAttr(f"{pivot_grp}.rotateX", rot_offset[0])
+        cmds.setAttr(f"{pivot_grp}.rotateY", rot_offset[1])
+        cmds.setAttr(f"{pivot_grp}.rotateZ", rot_offset[2])
+
+        # Unparent back to world
         cmds.parent(pivot_grp, world=True)
 
         return True
@@ -506,6 +521,10 @@ def enter_pivot_mode(settings_node: str) -> Tuple[bool, str]:
 
     # Select the pivot group
     cmds.select(pivot_grp)
+
+    # Activate the Move tool first - ctxEditMode only works with transform tools
+    # On first run, user might be in Select mode which doesn't have insert mode
+    cmds.setToolTo('moveSuperContext')
 
     # Enter pivot/insert mode
     cmds.ctxEditMode()  # This toggles insert mode for the current tool
