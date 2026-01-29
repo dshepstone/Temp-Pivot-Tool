@@ -18,15 +18,28 @@ Hierarchy Structure:
       └── pivot_grp (user adjusts pivot here, constrains control)
             └── settings node
 
+ALIGNMENT METHODOLOGY (Constraint-Based Snap):
+    This tool uses constraint-based snapping instead of Maya's matchTransform
+    or direct xform world-space operations. The reason:
+
+    - matchTransform/xform ws=True can rewrite local transform values in ways
+      that break expected parent-child offsets, especially in complex hierarchies.
+    - Constraint-based snap creates a temporary constraint (maintainOffset=False),
+      which "solves" the target's local matrix through its parent space, then
+      immediately deletes the constraint.
+    - This preserves the natural parent-child relationship and ensures children
+      follow correctly after the snap.
+
 Features:
 - Two-group hierarchy preserves pivot offset naturally
+- Constraint-based snap for reliable realignment
 - Auto pivot mode with smart exit detection
 - Auto-key on toggle off
 - Edit Temp Pivot button to adjust pivot location
 
 Author: David Shepstone
 License: MIT
-Version: 7.0.0
+Version: 8.0.0
 """
 
 from __future__ import annotations
@@ -102,24 +115,288 @@ TOOLTIPS = {
 }
 
 
+# =============================================================================
+# CONSTRAINT-BASED SNAP SYSTEM
+# =============================================================================
+#
+# WHY CONSTRAINT-BASED SNAP?
+#
+# Maya's matchTransform and xform(ws=True) commands perform a one-time
+# world-space "teleport" that directly overwrites local transform values.
+# This can break expected parent-child offsets because:
+#
+# 1. The local matrix is recomputed to achieve the world position, but this
+#    doesn't account for how the hierarchy should behave when the parent moves.
+#
+# 2. Children may not follow correctly because their relationship to the
+#    parent is effectively "baked out."
+#
+# The constraint-based approach:
+# 1. Creates a temporary constraint (parentConstraint or pointConstraint)
+# 2. Sets maintainOffset=False so the driven object snaps exactly to driver
+# 3. Maya's constraint system solves the driven object's local transform
+#    values through its parent hierarchy
+# 4. Immediately deletes the constraint
+#
+# Result: The local matrix is computed correctly relative to the parent,
+# so when the parent moves later, children follow as expected.
+# =============================================================================
+
+
+def snap_transform(
+    driver: str,
+    driven: str,
+    mode: str = "parent",
+    translate: bool = True,
+    rotate: bool = True,
+    preserve_selection: bool = True,
+    use_undo_chunk: bool = True
+) -> Tuple[bool, str]:
+    """
+    Snap driven object to driver using temporary constraint.
+
+    This is the core alignment function that replaces matchTransform/xform.
+    It uses constraints to properly solve local transforms through the
+    parent hierarchy, ensuring children follow correctly after snap.
+
+    Args:
+        driver: The object to snap TO (the target position)
+        driven: The object being snapped (will move to driver's position)
+        mode: "parent" for full transform, "point" for translation only,
+              "orient" for rotation only
+        translate: Whether to snap translation (used with mode="parent")
+        rotate: Whether to snap rotation (used with mode="parent")
+        preserve_selection: If True, restore original selection after snap
+        use_undo_chunk: If True, wrap in undo chunk for clean undo
+
+    Returns:
+        Tuple of (success, message)
+
+    Validation Tests:
+        1. Create rig, offset pivot, toggle OFF, move control, toggle ON
+           → align_grp snaps to control, pivot_grp retains local offset
+        2. After snap, moving control → hierarchy follows correctly
+        3. Repeated toggles do not accumulate drift
+    """
+    # Validate inputs
+    if not driver or not cmds.objExists(driver):
+        msg = f"Snap failed: driver '{driver}' does not exist."
+        cmds.warning(msg)
+        return False, msg
+
+    if not driven or not cmds.objExists(driven):
+        msg = f"Snap failed: driven '{driven}' does not exist."
+        cmds.warning(msg)
+        return False, msg
+
+    # Store original selection if needed
+    original_selection = None
+    if preserve_selection:
+        original_selection = cmds.ls(selection=True, long=True) or []
+
+    # Open undo chunk if requested
+    if use_undo_chunk:
+        cmds.undoInfo(openChunk=True, chunkName="snap_transform")
+
+    try:
+        # Check for locked channels and determine what we can snap
+        skip_translate = []
+        skip_rotate = []
+
+        # Check translate locks
+        for axis in ["x", "y", "z"]:
+            attr_path = f"{driven}.t{axis}"
+            if cmds.objExists(attr_path):
+                if cmds.getAttr(attr_path, lock=True):
+                    skip_translate.append(axis)
+                # Also check if connected (would fail constraint)
+                conns = cmds.listConnections(attr_path, source=True, destination=False) or []
+                if conns:
+                    skip_translate.append(axis)
+
+        # Check rotate locks
+        for axis in ["x", "y", "z"]:
+            attr_path = f"{driven}.r{axis}"
+            if cmds.objExists(attr_path):
+                if cmds.getAttr(attr_path, lock=True):
+                    skip_rotate.append(axis)
+                conns = cmds.listConnections(attr_path, source=True, destination=False) or []
+                if conns:
+                    skip_rotate.append(axis)
+
+        # Remove duplicates
+        skip_translate = list(set(skip_translate))
+        skip_rotate = list(set(skip_rotate))
+
+        # Determine if we can do any snapping
+        can_translate = translate and len(skip_translate) < 3
+        can_rotate = rotate and len(skip_rotate) < 3
+
+        if not can_translate and not can_rotate:
+            msg = f"Snap failed: all channels on '{driven}' are locked or connected."
+            cmds.warning(msg)
+            return False, msg
+
+        # Warn about partial snapping
+        if skip_translate or skip_rotate:
+            skipped = []
+            if skip_translate:
+                skipped.append(f"translate {skip_translate}")
+            if skip_rotate:
+                skipped.append(f"rotate {skip_rotate}")
+            cmds.warning(f"Snap: skipping locked/connected channels on '{driven}': {', '.join(skipped)}")
+
+        # Perform the constraint-based snap
+        constraint = None
+
+        if mode == "point" or (can_translate and not can_rotate):
+            # Point constraint for translation only
+            try:
+                constraint = cmds.pointConstraint(
+                    driver, driven,
+                    maintainOffset=False,
+                    skip=skip_translate if skip_translate else []
+                )[0]
+            except RuntimeError as e:
+                msg = f"Point constraint failed on '{driven}': {e}"
+                cmds.warning(msg)
+                return False, msg
+
+        elif mode == "orient" or (can_rotate and not can_translate):
+            # Orient constraint for rotation only
+            try:
+                constraint = cmds.orientConstraint(
+                    driver, driven,
+                    maintainOffset=False,
+                    skip=skip_rotate if skip_rotate else []
+                )[0]
+            except RuntimeError as e:
+                msg = f"Orient constraint failed on '{driven}': {e}"
+                cmds.warning(msg)
+                return False, msg
+
+        else:
+            # Parent constraint for full transform
+            try:
+                constraint = cmds.parentConstraint(
+                    driver, driven,
+                    maintainOffset=False,
+                    skipTranslate=skip_translate if skip_translate else [],
+                    skipRotate=skip_rotate if skip_rotate else []
+                )[0]
+            except RuntimeError as e:
+                msg = f"Parent constraint failed on '{driven}': {e}"
+                cmds.warning(msg)
+                return False, msg
+
+        # Immediately delete the constraint
+        if constraint and cmds.objExists(constraint):
+            cmds.delete(constraint)
+
+        return True, f"Snapped '{driven}' to '{driver}'"
+
+    except Exception as e:
+        msg = f"Snap failed with error: {e}"
+        cmds.warning(msg)
+        return False, msg
+
+    finally:
+        # Close undo chunk
+        if use_undo_chunk:
+            cmds.undoInfo(closeChunk=True)
+
+        # Restore selection
+        if preserve_selection and original_selection is not None:
+            try:
+                if original_selection:
+                    cmds.select(original_selection, replace=True)
+                else:
+                    cmds.select(clear=True)
+            except:
+                pass  # Selection restore is best-effort
+
+
+def get_local_transform(node: str) -> Dict[str, List[float]]:
+    """
+    Get the local transform values of a node.
+
+    Returns a dictionary with translate, rotate, scale, and rotatePivot
+    in local space. This is used to store/restore pivot_grp's local
+    position relative to align_grp.
+
+    Args:
+        node: The node to query
+
+    Returns:
+        Dictionary with 'translate', 'rotate', 'scale', 'rotatePivot', 'scalePivot'
+    """
+    result = {
+        "translate": [0.0, 0.0, 0.0],
+        "rotate": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0],
+        "rotatePivot": [0.0, 0.0, 0.0],
+        "scalePivot": [0.0, 0.0, 0.0],
+    }
+
+    if not node or not cmds.objExists(node):
+        return result
+
+    try:
+        result["translate"] = cmds.xform(node, q=True, os=True, translation=True)
+        result["rotate"] = cmds.xform(node, q=True, os=True, rotation=True)
+        result["scale"] = cmds.xform(node, q=True, os=True, scale=True)
+        result["rotatePivot"] = cmds.xform(node, q=True, os=True, rotatePivot=True)
+        result["scalePivot"] = cmds.xform(node, q=True, os=True, scalePivot=True)
+    except:
+        pass
+
+    return result
+
+
+def set_local_transform(node: str, transform_data: Dict[str, List[float]]) -> bool:
+    """
+    Set the local transform values of a node.
+
+    Args:
+        node: The node to set transforms on
+        transform_data: Dictionary from get_local_transform()
+
+    Returns:
+        True if successful
+    """
+    if not node or not cmds.objExists(node):
+        return False
+
+    try:
+        if "translate" in transform_data:
+            cmds.xform(node, os=True, translation=transform_data["translate"])
+        if "rotate" in transform_data:
+            cmds.xform(node, os=True, rotation=transform_data["rotate"])
+        if "scale" in transform_data:
+            cmds.xform(node, os=True, scale=transform_data["scale"])
+        if "rotatePivot" in transform_data:
+            cmds.xform(node, os=True, rotatePivot=transform_data["rotatePivot"])
+        if "scalePivot" in transform_data:
+            cmds.xform(node, os=True, scalePivot=transform_data["scalePivot"])
+        return True
+    except Exception as e:
+        cmds.warning(f"Failed to set local transform on '{node}': {e}")
+        return False
+
+
 # -----------------------------
 # Utility Functions
 # -----------------------------
 
 def _sanitize_name(name: str) -> str:
-    """Create a safe prefix from a control name."""
+    """Create a safe prefix from a control name, handling namespaces."""
+    # Handle namespaces - take the last part after any colons
     safe = name.split(":")[-1]
-    safe = safe.replace("|", "_").replace(" ", "_")
+    # Handle DAG paths - take the last part after any pipes
+    safe = safe.split("|")[-1]
+    # Replace other problematic characters
+    safe = safe.replace(" ", "_")
     return safe
-
-
-def _match_transform_world(source: str, target: str) -> None:
-    """
-    Match source to target's world-space transform using temporary constraint.
-    This is reliable regardless of rotation orders or parent hierarchies.
-    """
-    temp_constraint = cmds.parentConstraint(target, source, maintainOffset=False)[0]
-    cmds.delete(temp_constraint)
 
 
 def _has_constraints(node: str) -> Tuple[bool, List[str]]:
@@ -421,6 +698,9 @@ def create_temp_pivot(control: str) -> Tuple[bool, str, Optional[str]]:
           └── pivot_grp (user moves pivot here)
                 └── settings node
 
+    Uses constraint-based snap for initial alignment to ensure proper
+    local transform values that will behave correctly in the hierarchy.
+
     Args:
         control: The control to create a temp pivot for
 
@@ -450,15 +730,28 @@ def create_temp_pivot(control: str) -> Tuple[bool, str, Optional[str]]:
     # Create align_grp (parent - this realigns to control on toggle)
     # =========================================================================
     align_grp = cmds.group(empty=True, name=f"{prefix}{ALIGN_GRP_SUFFIX}")
-    _match_transform_world(align_grp, control)
+
+    # Use constraint-based snap to align to control
+    success, msg = snap_transform(control, align_grp, mode="parent", use_undo_chunk=False)
+    if not success:
+        cmds.delete(align_grp)
+        return False, f"Failed to create temp pivot: {msg}", None
 
     # =========================================================================
     # Create pivot_grp (child - user adjusts pivot here)
     # =========================================================================
     pivot_grp = cmds.group(empty=True, name=f"{prefix}{PIVOT_GRP_SUFFIX}")
-    _match_transform_world(pivot_grp, control)
+
+    # Snap to control position before parenting
+    success, msg = snap_transform(control, pivot_grp, mode="parent", use_undo_chunk=False)
+    if not success:
+        cmds.delete(align_grp)
+        cmds.delete(pivot_grp)
+        return False, f"Failed to create temp pivot: {msg}", None
 
     # Parent pivot_grp under align_grp
+    # After parenting, pivot_grp's local transform should be identity (0,0,0)
+    # because both were snapped to the same position
     cmds.parent(pivot_grp, align_grp)
 
     # Add a locator shape for visibility
@@ -537,15 +830,20 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     Reactivate the temp pivot system.
 
     Process:
-    1. Realign align_grp to the control's current world position/rotation
-    2. pivot_grp (child of align_grp) moves with it, preserving its pivot offset
-    3. Create parentConstraint: pivot_grp → control
+    1. Store pivot_grp's local transform (the pivot offset relative to align_grp)
+    2. Snap align_grp to the control's current world position using constraint
+    3. Restore pivot_grp's local transform (maintains pivot offset)
+    4. Create parentConstraint: pivot_grp → control
 
-    The two-group hierarchy naturally preserves the pivot:
-    - align_grp realigns to control
-    - pivot_grp follows as a child (local transform preserved)
-    - pivot_grp's rotatePivot offset is unchanged
-    - Result: pivot stays at same relative position to control
+    The constraint-based snap ensures align_grp's local values are computed
+    correctly through its parent hierarchy. The pivot offset is preserved
+    because we store and restore pivot_grp's LOCAL transform, not world.
+
+    Validation Tests:
+        1. Create rig, offset pivot, toggle OFF, move control, toggle ON
+           → align_grp snaps to control, pivot_grp retains rig-space offset
+        2. After toggle ON, moving control → children follow correctly
+        3. Repeated toggles do not drift or accumulate error
 
     Args:
         settings_node: The settings node for this rig
@@ -572,10 +870,32 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         return False, "Pivot group not found."
 
     # =========================================================================
-    # Realign align_grp to the control's world position/rotation
-    # pivot_grp (as a child) will follow, keeping its local transform & pivot
+    # Store pivot_grp's local transform BEFORE snapping align_grp
+    # This is the "pivot offset" - the user-defined pivot position relative
+    # to where the align_grp is positioned.
     # =========================================================================
-    _match_transform_world(align_grp, control)
+    pivot_local_transform = get_local_transform(pivot_grp)
+
+    # =========================================================================
+    # Snap align_grp to the control's world position using constraint
+    # This properly solves the local matrix through parent hierarchy
+    # =========================================================================
+    success, msg = snap_transform(
+        control, align_grp,
+        mode="parent",
+        preserve_selection=True,
+        use_undo_chunk=False
+    )
+
+    if not success:
+        return False, f"Failed to realign temp pivot: {msg}"
+
+    # =========================================================================
+    # Restore pivot_grp's local transform
+    # Because we're setting LOCAL values (not world), the pivot stays at
+    # the same offset relative to align_grp's new position
+    # =========================================================================
+    set_local_transform(pivot_grp, pivot_local_transform)
 
     # =========================================================================
     # Create parentConstraint: pivot_grp → control
