@@ -3,31 +3,32 @@ Temp Pivot Tool for Autodesk Maya
 
 A non-destructive, reusable temporary pivot system for animation.
 
-TWO-STAGE SETUP PROCESS:
-  Stage 1: Create locator_1 (pivot) - user moves this to desired pivot location
-  Stage 2: Complete setup - creates locator_2 (driver), null_GRP, parenting, constraint
+TWO-NULL ARCHITECTURE:
+  null_group_1: The TEMP PIVOT - user adjusts its pivot position using Maya's "Adjust Pivot" tool
+  null_group_2: The POSITION ANCHOR - created on toggle OFF, holds null_group_1 relative to control
 
-Hierarchy Structure:
-    null_GRP (anchor - at control position)
-      └ locator_1 (PIVOT - user positioned this in Stage 1)
-          └ locator_2 (DRIVER - at control position, constrains control)
+Hierarchy when ACTIVE (constraint ON):
+    null_group_2 (aligned to control position)
+      └ null_group_1 (TEMP PIVOT - user has set custom pivot point)
+         └ [parentConstraint] → control
 
 Workflow:
 1. Select control, click "Create Pivot Locator" (Stage 1)
-2. Move locator_1 to where you want the pivot point
-3. Click "Complete Setup" (Stage 2) - creates driver, hierarchy, constraint
-4. Rotate locator_1 - control orbits around the pivot (auto-keys applied)
-5. Toggle OFF - constraint deleted, rig hidden
-6. Toggle ON - rig realigns to control, constraint recreated
+2. Use Maya's "Adjust Pivot" tool (D key or Insert) to position the pivot
+3. Click "Complete Setup" (Stage 2) - creates constraint to control
+4. Rotate null_group_1 - control orbits around the custom pivot point (auto-keys applied)
+5. Toggle OFF - creates null_group_2 as anchor, constraint deleted, control free to move
+6. Move control to new position
+7. Toggle ON - null_group_2 realigns to control, constraint recreated
 
 Features:
-- Auto-key: When you rotate locator_1, keyframes are automatically set on the control
-- Constraint-based alignment: Proper world-space alignment regardless of local space or parent hierarchy
-- Constraint validation: Warns if control has existing constraints that could cause double transforms
+- Auto-key: When you transform null_group_1, keyframes are automatically set on the control
+- World-matrix alignment: Proper world-space alignment using full transformation matrix
+- Constraint validation: Warns if control has existing constraints
 
 Author: David Shepstone
 License: MIT
-Version: 5.4.1
+Version: 6.0.0
 """
 
 from __future__ import annotations
@@ -45,10 +46,9 @@ WINDOW_NAME = "tempPivotToolWindow"
 WINDOW_TITLE = "Temp Pivot Tool"
 TOOL_PREFIX = "TMP"
 
-# Node naming convention
-NULL_GRP_SUFFIX = f"_{TOOL_PREFIX}_null_GRP"
-LOCATOR_1_SUFFIX = f"_{TOOL_PREFIX}_locator_1"  # PIVOT - user positions this
-LOCATOR_2_SUFFIX = f"_{TOOL_PREFIX}_locator_2"  # DRIVER - constrains control
+# Node naming convention (new two-null architecture)
+NULL_GRP_1_SUFFIX = f"_{TOOL_PREFIX}_pivot"      # TEMP PIVOT - user adjusts pivot point
+NULL_GRP_2_SUFFIX = f"_{TOOL_PREFIX}_anchor"     # POSITION ANCHOR - holds pivot relative to control
 SETTINGS_SUFFIX = f"_{TOOL_PREFIX}_settings"
 CONSTRAINT_SUFFIX = f"_{TOOL_PREFIX}_parentConstraint"
 
@@ -70,30 +70,28 @@ UI_COLORS = {
 # Tooltips
 TOOLTIPS = {
     "create_pivot_btn": (
-        "STAGE 1: Create the pivot locator (locator_1).\n\n"
-        "1. Creates locator_1 at the control's position\n"
-        "2. Move this locator to your desired pivot point\n"
+        "STAGE 1: Create the pivot null (null_group_1).\n\n"
+        "1. Creates null_group_1 aligned to the control\n"
+        "2. Use Maya's 'Adjust Pivot' tool (D key or Insert)\n"
+        "   to move the pivot to your desired position\n"
         "3. Then click 'Complete Setup' to finish"
     ),
     "complete_setup_btn": (
         "STAGE 2: Complete the pivot rig setup.\n\n"
-        "1. Creates locator_2 (driver) at control position\n"
-        "2. Parents locator_2 under locator_1\n"
-        "3. Creates null_GRP at control position\n"
-        "4. Parents locator_1 under null_GRP\n"
-        "5. Creates parentConstraint: locator_2 → control\n\n"
-        "After this, rotating locator_1 will orbit the control."
+        "1. Creates parentConstraint: null_group_1 → control\n"
+        "2. After this, rotating null_group_1 will orbit the control\n"
+        "   around the custom pivot point you set."
     ),
     "toggle_btn": (
         "Toggle the temp pivot ON/OFF.\n\n"
-        "OFF: Deletes constraint, hides rig.\n"
-        "     Control stays in place (key it first!).\n\n"
-        "ON: Realigns null_GRP to control position,\n"
+        "OFF: Creates null_group_2 as anchor,\n"
+        "     deletes constraint, control free to move.\n\n"
+        "ON: Realigns null_group_2 to control position,\n"
         "    recreates constraint."
     ),
     "key_btn": (
         "Set keyframes on the control's translate and rotate.\n"
-        "Note: Keys are set automatically when you rotate locator_1.\n"
+        "Note: Keys are set automatically when you transform null_group_1.\n"
         "Use this button for manual keying if needed."
     ),
     "delete_btn": (
@@ -101,7 +99,7 @@ TOOLTIPS = {
         "Removes all rig nodes and cleans up constraints."
     ),
     "select_pivot_btn": (
-        "Select locator_1 (the pivot locator).\n"
+        "Select null_group_1 (the pivot null).\n"
         "Rotate this to orbit the control around the pivot."
     ),
     "select_control_btn": (
@@ -122,40 +120,37 @@ def _sanitize_name(name: str) -> str:
     return safe
 
 
-def _get_world_position(node: str) -> List[float]:
-    """Get world-space position using rotatePivot for accuracy."""
-    # Use rotatePivot query which gives true world position
-    return cmds.xform(node, q=True, ws=True, rp=True)
-
-
-def _match_transform_world(source: str, target: str, translate: bool = True, rotate: bool = True) -> None:
+def _align_to_target_world_matrix(object_to_align: str, target: str) -> None:
     """
-    Match source to target's world-space transform using temporary constraint.
+    Align object_to_align to target's world-space transform using world matrix.
 
-    This is the most reliable method to match world-space transforms regardless
-    of rotation orders, gimbal lock, or parent hierarchies.
+    This method uses the full world transformation matrix to bypass rotation
+    order issues and gimbal lock problems.
+
+    Based on the MEL alignToFirstFixed() approach.
     """
-    # Create a temporary parent constraint
-    temp_constraint = cmds.parentConstraint(
-        target, source,
-        maintainOffset=False,
-        skipTranslate=[] if translate else ["x", "y", "z"],
-        skipRotate=[] if rotate else ["x", "y", "z"]
-    )[0]
-    # Delete immediately - the source is now at target's world position/rotation
-    cmds.delete(temp_constraint)
+    # Get target's world position
+    pos = cmds.xform(target, q=True, ws=True, t=True)
+
+    # Get target's world matrix (16 values)
+    matrix = cmds.xform(target, q=True, ws=True, m=True)
+
+    # Apply the full world matrix to the object
+    # This bypasses rotation order issues
+    cmds.xform(
+        object_to_align, ws=True, m=[
+            matrix[0], matrix[1], matrix[2], matrix[3],
+            matrix[4], matrix[5], matrix[6], matrix[7],
+            matrix[8], matrix[9], matrix[10], matrix[11],
+            matrix[12], matrix[13], matrix[14], matrix[15]
+        ]
+    )
 
 
 def _match_translation_world(source: str, target: str) -> None:
-    """Match only world-space translation using point constraint."""
-    temp_constraint = cmds.pointConstraint(target, source, maintainOffset=False)[0]
-    cmds.delete(temp_constraint)
-
-
-def _match_rotation_world(source: str, target: str) -> None:
-    """Match only world-space rotation using orient constraint."""
-    temp_constraint = cmds.orientConstraint(target, source, maintainOffset=False)[0]
-    cmds.delete(temp_constraint)
+    """Match only world-space translation using xform."""
+    pos = cmds.xform(target, q=True, ws=True, t=True)
+    cmds.xform(source, ws=True, t=pos)
 
 
 def _has_constraints(node: str) -> Tuple[bool, List[str]]:
@@ -204,6 +199,71 @@ def _add_bool_attr(node: str, attr: str, value: bool = False) -> None:
     cmds.setAttr(f"{node}.{attr}", value)
 
 
+def _create_visual_null(name: str, color: Tuple[float, float, float], size: float = 1.0) -> str:
+    """
+    Create a null group with visual circle indicators.
+
+    Args:
+        name: Name for the null group
+        color: RGB color tuple (0-1 range)
+        size: Scale factor for the visual indicators
+
+    Returns:
+        The name of the created null group
+    """
+    # Create the null group
+    null_grp = cmds.group(empty=True, name=name)
+
+    # Add visual circles for each axis
+    for axis, axis_color, normal in [
+        ("X", (1, 0.3, 0.3), (1, 0, 0)),
+        ("Y", (0.3, 1, 0.3), (0, 1, 0)),
+        ("Z", (0.3, 0.5, 1), (0, 0, 1))
+    ]:
+        circle = cmds.circle(
+            name=f"{name}_ring{axis}",
+            normal=normal,
+            radius=0.5 * size,
+            degree=3,
+            sections=24,
+            constructionHistory=False
+        )[0]
+        circle_shape = cmds.listRelatives(circle, shapes=True)[0]
+        cmds.setAttr(f"{circle_shape}.overrideEnabled", 1)
+        cmds.setAttr(f"{circle_shape}.overrideRGBColors", 1)
+        cmds.setAttr(f"{circle_shape}.overrideColorR", axis_color[0])
+        cmds.setAttr(f"{circle_shape}.overrideColorG", axis_color[1])
+        cmds.setAttr(f"{circle_shape}.overrideColorB", axis_color[2])
+        cmds.parent(circle_shape, null_grp, shape=True, relative=True)
+        cmds.delete(circle)
+
+    # Add a center locator shape for selection clarity
+    loc = cmds.spaceLocator(name=f"{name}_loc")[0]
+    loc_shape = cmds.listRelatives(loc, shapes=True)[0]
+    cmds.setAttr(f"{loc_shape}.overrideEnabled", 1)
+    cmds.setAttr(f"{loc_shape}.overrideRGBColors", 1)
+    cmds.setAttr(f"{loc_shape}.overrideColorR", color[0])
+    cmds.setAttr(f"{loc_shape}.overrideColorG", color[1])
+    cmds.setAttr(f"{loc_shape}.overrideColorB", color[2])
+    cmds.setAttr(f"{loc_shape}.localScaleX", 0.3 * size)
+    cmds.setAttr(f"{loc_shape}.localScaleY", 0.3 * size)
+    cmds.setAttr(f"{loc_shape}.localScaleZ", 0.3 * size)
+    cmds.parent(loc_shape, null_grp, shape=True, relative=True)
+    cmds.delete(loc)
+
+    return null_grp
+
+
+def _set_null_color(null_grp: str, color: Tuple[float, float, float]) -> None:
+    """Set the color of the locator shape in a null group."""
+    shapes = cmds.listRelatives(null_grp, shapes=True) or []
+    for shape in shapes:
+        if cmds.nodeType(shape) == "locator":
+            cmds.setAttr(f"{shape}.overrideColorR", color[0])
+            cmds.setAttr(f"{shape}.overrideColorG", color[1])
+            cmds.setAttr(f"{shape}.overrideColorB", color[2])
+
+
 # -----------------------------
 # Rig Discovery Functions
 # -----------------------------
@@ -226,17 +286,17 @@ def get_rig_for_control(control: str) -> Optional[str]:
 
 
 def get_pending_pivot_for_control(control: str) -> Optional[str]:
-    """Find a pending (stage 1) pivot locator for a control."""
-    # Look for locator_1 that has a targetControl attr but no nullGrp yet
-    locators = cmds.ls(f"*{LOCATOR_1_SUFFIX}", type="transform") or []
-    for loc in locators:
-        if cmds.attributeQuery("targetControl", node=loc, exists=True):
-            target = cmds.getAttr(f"{loc}.targetControl")
+    """Find a pending (stage 1) pivot null for a control."""
+    # Look for null_group_1 that has a targetControl attr but no setupComplete=True yet
+    pivot_nulls = cmds.ls(f"*{NULL_GRP_1_SUFFIX}", type="transform") or []
+    for pivot in pivot_nulls:
+        if cmds.attributeQuery("targetControl", node=pivot, exists=True):
+            target = cmds.getAttr(f"{pivot}.targetControl")
             if target == control:
-                # Check if setup is complete (has nullGrp)
-                if cmds.attributeQuery("setupComplete", node=loc, exists=True):
-                    if not cmds.getAttr(f"{loc}.setupComplete"):
-                        return loc
+                # Check if setup is complete
+                if cmds.attributeQuery("setupComplete", node=pivot, exists=True):
+                    if not cmds.getAttr(f"{pivot}.setupComplete"):
+                        return pivot
     return None
 
 
@@ -244,9 +304,8 @@ def get_rig_nodes(settings_node: str) -> Dict[str, Optional[str]]:
     """Get all rig node names from a settings node."""
     result = {
         "settings": settings_node,
-        "null_grp": None,
-        "locator_1": None,  # Pivot
-        "locator_2": None,  # Driver
+        "null_grp_1": None,  # Pivot
+        "null_grp_2": None,  # Anchor (may not exist yet)
         "control": None,
         "constraint": None,
     }
@@ -254,12 +313,10 @@ def get_rig_nodes(settings_node: str) -> Dict[str, Optional[str]]:
     if not cmds.objExists(settings_node):
         return result
 
-    if cmds.attributeQuery("nullGrp", node=settings_node, exists=True):
-        result["null_grp"] = cmds.getAttr(f"{settings_node}.nullGrp") or None
-    if cmds.attributeQuery("locator1", node=settings_node, exists=True):
-        result["locator_1"] = cmds.getAttr(f"{settings_node}.locator1") or None
-    if cmds.attributeQuery("locator2", node=settings_node, exists=True):
-        result["locator_2"] = cmds.getAttr(f"{settings_node}.locator2") or None
+    if cmds.attributeQuery("nullGrp1", node=settings_node, exists=True):
+        result["null_grp_1"] = cmds.getAttr(f"{settings_node}.nullGrp1") or None
+    if cmds.attributeQuery("nullGrp2", node=settings_node, exists=True):
+        result["null_grp_2"] = cmds.getAttr(f"{settings_node}.nullGrp2") or None
     if cmds.attributeQuery("targetControl", node=settings_node, exists=True):
         result["control"] = cmds.getAttr(f"{settings_node}.targetControl") or None
     if cmds.attributeQuery("constraintName", node=settings_node, exists=True):
@@ -278,24 +335,24 @@ def is_rig_active(settings_node: str) -> bool:
 
 
 # =============================================================================
-# STAGE 1: Create Pivot Locator
+# STAGE 1: Create Pivot Null
 # =============================================================================
 
 def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
     """
-    STAGE 1: Create the pivot locator (locator_1) for user positioning.
+    STAGE 1: Create the pivot null (null_group_1) for user pivot positioning.
 
     Process:
-    1. Create locator_1
-    2. Match position/rotation to the selected control
-    3. User will move this locator to desired pivot position
+    1. Create null_group_1
+    2. Align to the selected control using world matrix
+    3. User will use Maya's "Adjust Pivot" tool to set the pivot position
     4. Then user clicks "Complete Setup" for Stage 2
 
     Args:
         control: The control to create a pivot for
 
     Returns:
-        Tuple of (success, message, locator_1_name)
+        Tuple of (success, message, null_grp_1_name)
     """
     if not cmds.objExists(control):
         return False, f"Control '{control}' not found.", None
@@ -309,7 +366,7 @@ def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
     pending = get_pending_pivot_for_control(control)
     if pending:
         cmds.select(pending)
-        return False, f"Pivot locator already created. Move it, then click 'Complete Setup'.", pending
+        return False, f"Pivot null already created. Adjust its pivot, then click 'Complete Setup'.", pending
 
     # Check for existing constraints on the control (could cause double offset)
     has_constraints, constraint_list = _has_constraints(control)
@@ -323,154 +380,75 @@ def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
     prefix = _sanitize_name(control)
 
     # =========================================================================
-    # Create locator_1 (the PIVOT - user will position this)
+    # Create null_group_1 (the PIVOT - user will adjust its pivot point)
     # =========================================================================
-    locator_1 = cmds.spaceLocator(name=f"{prefix}{LOCATOR_1_SUFFIX}")[0]
+    null_grp_1 = _create_visual_null(
+        f"{prefix}{NULL_GRP_1_SUFFIX}",
+        UI_COLORS["stage1"],  # Orange for Stage 1
+        size=1.0
+    )
 
-    # Match to control's world position and rotation using constraint method
-    # This ensures proper world-space alignment regardless of control's local space
-    _match_transform_world(locator_1, control)
+    # Align to control's world position and rotation using world matrix
+    _align_to_target_world_matrix(null_grp_1, control)
 
-    # Style locator_1 (orange - indicates pivot point)
-    loc1_shape = cmds.listRelatives(locator_1, shapes=True)[0]
-    cmds.setAttr(f"{loc1_shape}.overrideEnabled", 1)
-    cmds.setAttr(f"{loc1_shape}.overrideRGBColors", 1)
-    cmds.setAttr(f"{loc1_shape}.overrideColorR", UI_COLORS["stage1"][0])
-    cmds.setAttr(f"{loc1_shape}.overrideColorG", UI_COLORS["stage1"][1])
-    cmds.setAttr(f"{loc1_shape}.overrideColorB", UI_COLORS["stage1"][2])
-    cmds.setAttr(f"{loc1_shape}.localScaleX", 0.5)
-    cmds.setAttr(f"{loc1_shape}.localScaleY", 0.5)
-    cmds.setAttr(f"{loc1_shape}.localScaleZ", 0.5)
+    # Store target control reference on the null (for Stage 2)
+    _add_string_attr(null_grp_1, "targetControl", control)
+    _add_bool_attr(null_grp_1, "setupComplete", False)
 
-    # Add visual rings to locator_1 (pivot indicator)
-    for axis, color, normal in [
-        ("X", (1, 0.3, 0.3), (1, 0, 0)),
-        ("Y", (0.3, 1, 0.3), (0, 1, 0)),
-        ("Z", (0.3, 0.5, 1), (0, 0, 1))
-    ]:
-        circle = cmds.circle(
-            name=f"{prefix}{LOCATOR_1_SUFFIX}_ring{axis}",
-            normal=normal,
-            radius=0.6,
-            degree=3,
-            sections=24,
-            constructionHistory=False
-        )[0]
-        circle_shape = cmds.listRelatives(circle, shapes=True)[0]
-        cmds.setAttr(f"{circle_shape}.overrideEnabled", 1)
-        cmds.setAttr(f"{circle_shape}.overrideRGBColors", 1)
-        cmds.setAttr(f"{circle_shape}.overrideColorR", color[0])
-        cmds.setAttr(f"{circle_shape}.overrideColorG", color[1])
-        cmds.setAttr(f"{circle_shape}.overrideColorB", color[2])
-        cmds.parent(circle_shape, locator_1, shape=True, relative=True)
-        cmds.delete(circle)
+    # Select the null so user can adjust its pivot
+    cmds.select(null_grp_1)
 
-    # Store target control reference on the locator (for Stage 2)
-    _add_string_attr(locator_1, "targetControl", control)
-    _add_bool_attr(locator_1, "setupComplete", False)
-
-    # Select the locator so user can move it
-    cmds.select(locator_1)
-
-    return True, f"Stage 1 complete. Move locator_1 to pivot position, then click 'Complete Setup'.", locator_1
+    return True, f"Stage 1 complete. Use 'Adjust Pivot' tool (D key) to set pivot position, then click 'Complete Setup'.", null_grp_1
 
 
 # =============================================================================
 # STAGE 2: Complete Setup
 # =============================================================================
 
-def complete_setup(locator_1: str) -> Tuple[bool, str, Optional[str]]:
+def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     """
     STAGE 2: Complete the pivot rig setup.
 
     Process:
-    1. Get the target control from locator_1
-    2. Create locator_2 (driver) at control position
-    3. Parent locator_2 under locator_1
-    4. Create null_GRP
-    5. Match null_GRP to locator_2 (control position)
-    6. Parent locator_1 under null_GRP
-    7. Create parentConstraint: locator_2 → control (maintainOffset)
-    8. Create settings node
+    1. Get the target control from null_group_1
+    2. Create parentConstraint: null_group_1 → control (maintainOffset)
+    3. Create settings node
 
-    Resulting hierarchy:
-        null_GRP (at control position)
-          └ locator_1 (PIVOT - user positioned)
-              └ locator_2 (DRIVER - constrains control)
+    Note: null_group_2 is NOT created here - it's created on first toggle OFF.
 
     Args:
-        locator_1: The pivot locator from Stage 1
+        null_grp_1: The pivot null from Stage 1
 
     Returns:
         Tuple of (success, message, settings_node_name)
     """
-    if not cmds.objExists(locator_1):
-        return False, "Locator_1 not found.", None
+    if not cmds.objExists(null_grp_1):
+        return False, "Pivot null not found.", None
 
     # Get target control
-    if not cmds.attributeQuery("targetControl", node=locator_1, exists=True):
-        return False, "Locator_1 is not a valid pivot locator (missing targetControl).", None
+    if not cmds.attributeQuery("targetControl", node=null_grp_1, exists=True):
+        return False, "Pivot null is not valid (missing targetControl).", None
 
-    control = cmds.getAttr(f"{locator_1}.targetControl")
+    control = cmds.getAttr(f"{null_grp_1}.targetControl")
     if not cmds.objExists(control):
         return False, f"Target control '{control}' not found.", None
 
     # Check if already complete
-    if cmds.attributeQuery("setupComplete", node=locator_1, exists=True):
-        if cmds.getAttr(f"{locator_1}.setupComplete"):
-            return False, "Setup already complete for this locator.", None
+    if cmds.attributeQuery("setupComplete", node=null_grp_1, exists=True):
+        if cmds.getAttr(f"{null_grp_1}.setupComplete"):
+            return False, "Setup already complete for this pivot.", None
 
     prefix = _sanitize_name(control)
 
     # =========================================================================
-    # Create locator_2 (the DRIVER) at control position
-    # =========================================================================
-    locator_2 = cmds.spaceLocator(name=f"{prefix}{LOCATOR_2_SUFFIX}")[0]
-
-    # Match to control's world position using constraint method
-    _match_transform_world(locator_2, control)
-
-    # Style locator_2 (green - indicates driver)
-    loc2_shape = cmds.listRelatives(locator_2, shapes=True)[0]
-    cmds.setAttr(f"{loc2_shape}.overrideEnabled", 1)
-    cmds.setAttr(f"{loc2_shape}.overrideRGBColors", 1)
-    cmds.setAttr(f"{loc2_shape}.overrideColorR", 0.3)
-    cmds.setAttr(f"{loc2_shape}.overrideColorG", 1.0)
-    cmds.setAttr(f"{loc2_shape}.overrideColorB", 0.3)
-    cmds.setAttr(f"{loc2_shape}.localScaleX", 0.3)
-    cmds.setAttr(f"{loc2_shape}.localScaleY", 0.3)
-    cmds.setAttr(f"{loc2_shape}.localScaleZ", 0.3)
-
-    # =========================================================================
-    # Parent locator_2 under locator_1
-    # =========================================================================
-    cmds.parent(locator_2, locator_1)
-
-    # =========================================================================
-    # Create null_GRP
-    # =========================================================================
-    null_grp = cmds.group(empty=True, name=f"{prefix}{NULL_GRP_SUFFIX}")
-
-    # =========================================================================
-    # Match null_GRP to locator_2 (which is at control position)
-    # Using constraint-based matching for accurate world-space alignment
-    # =========================================================================
-    _match_transform_world(null_grp, locator_2)
-
-    # =========================================================================
-    # Parent locator_1 under null_GRP
-    # =========================================================================
-    cmds.parent(locator_1, null_grp)
-
-    # =========================================================================
-    # Create parentConstraint: locator_2 → control (maintainOffset=ON)
+    # Create parentConstraint: null_group_1 → control (maintainOffset=ON)
     # =========================================================================
     constraint_name = f"{prefix}{CONSTRAINT_SUFFIX}"
     if cmds.objExists(constraint_name):
         cmds.delete(constraint_name)
 
     constraint = cmds.parentConstraint(
-        locator_2, control,
+        null_grp_1, control,
         maintainOffset=True,
         name=constraint_name
     )[0]
@@ -483,33 +461,27 @@ def complete_setup(locator_1: str) -> Tuple[bool, str, Optional[str]]:
 
     # Store references
     _add_string_attr(settings_node, "targetControl", control)
-    _add_string_attr(settings_node, "nullGrp", null_grp)
-    _add_string_attr(settings_node, "locator1", locator_1)
-    _add_string_attr(settings_node, "locator2", locator_2)
+    _add_string_attr(settings_node, "nullGrp1", null_grp_1)
+    _add_string_attr(settings_node, "nullGrp2", "")  # Created on first toggle OFF
     _add_string_attr(settings_node, "constraintName", constraint)
     _add_bool_attr(settings_node, "isActive", True)
 
-    # Parent settings under null_grp
-    cmds.parent(settings_node, null_grp)
+    # Parent settings under null_grp_1 for organization
+    cmds.parent(settings_node, null_grp_1)
 
-    # Mark locator_1 setup as complete
-    cmds.setAttr(f"{locator_1}.setupComplete", True)
+    # Mark null_grp_1 setup as complete
+    cmds.setAttr(f"{null_grp_1}.setupComplete", True)
 
-    # Update locator_1 color to indicate active (green)
-    shapes = cmds.listRelatives(locator_1, shapes=True) or []
-    for shape in shapes:
-        if cmds.nodeType(shape) == "locator":
-            cmds.setAttr(f"{shape}.overrideColorR", UI_COLORS["success"][0])
-            cmds.setAttr(f"{shape}.overrideColorG", UI_COLORS["success"][1])
-            cmds.setAttr(f"{shape}.overrideColorB", UI_COLORS["success"][2])
+    # Update null_grp_1 color to indicate active (green)
+    _set_null_color(null_grp_1, UI_COLORS["success"])
 
-    # Set up auto-key for rotation changes
+    # Set up auto-key for transform changes
     setup_auto_key(settings_node)
 
-    # Select locator_1 so user can start using it
-    cmds.select(locator_1)
+    # Select null_grp_1 so user can start using it
+    cmds.select(null_grp_1)
 
-    return True, f"Setup complete! Rotate locator_1 to orbit '{control}' around pivot. Auto-key enabled.", settings_node
+    return True, f"Setup complete! Rotate pivot null to orbit '{control}' around custom pivot. Auto-key enabled.", settings_node
 
 
 # =============================================================================
@@ -521,13 +493,10 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     Reactivate the temp pivot system.
 
     Process:
-    1. Match null_GRP to control (realigns rig to control's current position)
-    2. Reset locator_1's LOCAL rotation to zero (preserve pivot offset translation)
-    3. Recreate parentConstraint: locator_2 → control (maintainOffset)
+    1. Realign null_group_2 to control's current world position/rotation
+    2. Reset null_group_1's LOCAL transforms to zero
+    3. Recreate parentConstraint: null_group_1 → control (maintainOffset)
     4. Show visibility
-
-    Note: locator_1's local translation (pivot offset) is PRESERVED.
-    Only the local rotation is reset so orbital rotation starts fresh.
 
     Args:
         settings_node: The settings node for this rig
@@ -543,36 +512,36 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
 
     nodes = get_rig_nodes(settings_node)
     control = nodes["control"]
-    null_grp = nodes["null_grp"]
-    locator_1 = nodes["locator_1"]
-    locator_2 = nodes["locator_2"]
+    null_grp_1 = nodes["null_grp_1"]
+    null_grp_2 = nodes["null_grp_2"]
 
     if not control or not cmds.objExists(control):
         return False, f"Control '{control}' not found."
-    if not null_grp or not cmds.objExists(null_grp):
-        return False, "Null_GRP not found."
-    if not locator_1 or not cmds.objExists(locator_1):
-        return False, "Locator_1 (pivot) not found."
-    if not locator_2 or not cmds.objExists(locator_2):
-        return False, "Locator_2 (driver) not found."
+    if not null_grp_1 or not cmds.objExists(null_grp_1):
+        return False, "Pivot null (null_group_1) not found."
+    if not null_grp_2 or not cmds.objExists(null_grp_2):
+        return False, "Anchor null (null_group_2) not found. Cannot toggle ON."
 
     # =========================================================================
-    # Match null_GRP to control's world position and rotation
-    # Using constraint-based matching for accurate world-space alignment
-    # regardless of the control's local space or parent hierarchy
+    # Realign null_group_2 to control's current world position/rotation
+    # Using world matrix for accurate alignment
     # =========================================================================
-    _match_transform_world(null_grp, control)
+    _align_to_target_world_matrix(null_grp_2, control)
 
     # =========================================================================
-    # Reset locator_1's LOCAL rotation to zero (preserve pivot offset position)
-    # This resets the orbital rotation while maintaining the pivot point offset
+    # Reset null_group_1's LOCAL transforms to zero
+    # This resets the orbital rotation while the pivot offset is maintained
+    # by the pivot point position (rotatePivot/scalePivot)
     # =========================================================================
-    cmds.setAttr(f"{locator_1}.rx", 0)
-    cmds.setAttr(f"{locator_1}.ry", 0)
-    cmds.setAttr(f"{locator_1}.rz", 0)
+    cmds.setAttr(f"{null_grp_1}.tx", 0)
+    cmds.setAttr(f"{null_grp_1}.ty", 0)
+    cmds.setAttr(f"{null_grp_1}.tz", 0)
+    cmds.setAttr(f"{null_grp_1}.rx", 0)
+    cmds.setAttr(f"{null_grp_1}.ry", 0)
+    cmds.setAttr(f"{null_grp_1}.rz", 0)
 
     # =========================================================================
-    # Recreate parentConstraint: locator_2 → control
+    # Recreate parentConstraint: null_group_1 → control
     # =========================================================================
     prefix = _sanitize_name(control)
     constraint_name = f"{prefix}{CONSTRAINT_SUFFIX}"
@@ -581,7 +550,7 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         cmds.delete(constraint_name)
 
     constraint = cmds.parentConstraint(
-        locator_2, control,
+        null_grp_1, control,
         maintainOffset=True,
         name=constraint_name
     )[0]
@@ -593,23 +562,18 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     # =========================================================================
     # Show visibility
     # =========================================================================
-    cmds.setAttr(f"{null_grp}.visibility", 1)
+    cmds.setAttr(f"{null_grp_2}.visibility", 1)
 
-    # Update locator_1 color to active (green)
-    shapes = cmds.listRelatives(locator_1, shapes=True) or []
-    for shape in shapes:
-        if cmds.nodeType(shape) == "locator":
-            cmds.setAttr(f"{shape}.overrideColorR", UI_COLORS["success"][0])
-            cmds.setAttr(f"{shape}.overrideColorG", UI_COLORS["success"][1])
-            cmds.setAttr(f"{shape}.overrideColorB", UI_COLORS["success"][2])
+    # Update null_grp_1 color to active (green)
+    _set_null_color(null_grp_1, UI_COLORS["success"])
 
-    # Set up auto-key for rotation changes
+    # Set up auto-key for transform changes
     setup_auto_key(settings_node)
 
-    # Select locator_1
-    cmds.select(locator_1)
+    # Select null_grp_1
+    cmds.select(null_grp_1)
 
-    return True, f"Pivot ON. Rotate locator_1 to orbit '{control}'. Auto-key enabled."
+    return True, f"Pivot ON. Rotate pivot null to orbit '{control}'. Auto-key enabled."
 
 
 # =============================================================================
@@ -622,9 +586,11 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
 
     Process:
     1. Clean up auto-key scriptJobs
-    2. Delete the constraint
-    3. Hide visibility
-    4. Control stays in place (user should have keyed it)
+    2. Create null_group_2 if it doesn't exist (first toggle OFF)
+    3. Align null_group_2 to control's current position
+    4. Parent null_group_1 under null_group_2 (if not already)
+    5. Delete the constraint
+    6. Hide visibility (optional - keep visible for reference)
 
     Args:
         settings_node: The settings node for this rig
@@ -641,8 +607,13 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     nodes = get_rig_nodes(settings_node)
     control = nodes["control"]
     constraint = nodes["constraint"]
-    null_grp = nodes["null_grp"]
-    locator_1 = nodes["locator_1"]
+    null_grp_1 = nodes["null_grp_1"]
+    null_grp_2 = nodes["null_grp_2"]
+
+    if not control or not cmds.objExists(control):
+        return False, f"Control '{control}' not found."
+    if not null_grp_1 or not cmds.objExists(null_grp_1):
+        return False, "Pivot null (null_group_1) not found."
 
     # =========================================================================
     # Clean up auto-key scriptJobs
@@ -650,17 +621,53 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     cleanup_auto_key(settings_node)
 
     # =========================================================================
-    # Delete the constraint
+    # Delete the constraint FIRST (before creating/moving anchor)
     # =========================================================================
     if constraint and cmds.objExists(constraint):
         cmds.delete(constraint)
 
     # Also clean any other constraints from this tool
-    if control and cmds.objExists(control):
-        constraints = cmds.listRelatives(control, type="parentConstraint") or []
-        for c in constraints:
-            if CONSTRAINT_SUFFIX in c or TOOL_PREFIX in c:
-                cmds.delete(c)
+    constraints = cmds.listRelatives(control, type="parentConstraint") or []
+    for c in constraints:
+        if CONSTRAINT_SUFFIX in c or TOOL_PREFIX in c:
+            cmds.delete(c)
+
+    prefix = _sanitize_name(control)
+
+    # =========================================================================
+    # Create null_group_2 if it doesn't exist (first toggle OFF)
+    # =========================================================================
+    if not null_grp_2 or not cmds.objExists(null_grp_2):
+        null_grp_2 = _create_visual_null(
+            f"{prefix}{NULL_GRP_2_SUFFIX}",
+            UI_COLORS["stage2"],  # Blue for anchor
+            size=1.2  # Slightly larger to distinguish
+        )
+        # Store reference in settings
+        cmds.setAttr(f"{settings_node}.nullGrp2", null_grp_2, type="string")
+
+    # =========================================================================
+    # Align null_group_2 to control's current world position/rotation
+    # Using world matrix for accurate alignment
+    # =========================================================================
+    _align_to_target_world_matrix(null_grp_2, control)
+
+    # =========================================================================
+    # Parent null_group_1 under null_group_2 (if not already)
+    # =========================================================================
+    current_parent = cmds.listRelatives(null_grp_1, parent=True)
+    if not current_parent or current_parent[0] != null_grp_2:
+        cmds.parent(null_grp_1, null_grp_2)
+
+    # =========================================================================
+    # Reset null_group_1 local transforms (keep pivot offset via rotatePivot)
+    # =========================================================================
+    cmds.setAttr(f"{null_grp_1}.tx", 0)
+    cmds.setAttr(f"{null_grp_1}.ty", 0)
+    cmds.setAttr(f"{null_grp_1}.tz", 0)
+    cmds.setAttr(f"{null_grp_1}.rx", 0)
+    cmds.setAttr(f"{null_grp_1}.ry", 0)
+    cmds.setAttr(f"{null_grp_1}.rz", 0)
 
     # Clear constraint reference and set inactive
     cmds.setAttr(f"{settings_node}.constraintName", "", type="string")
@@ -669,19 +676,12 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     # =========================================================================
     # Hide visibility
     # =========================================================================
-    if null_grp and cmds.objExists(null_grp):
-        cmds.setAttr(f"{null_grp}.visibility", 0)
+    cmds.setAttr(f"{null_grp_2}.visibility", 0)
 
-    # Update locator_1 color to inactive (orange)
-    if locator_1 and cmds.objExists(locator_1):
-        shapes = cmds.listRelatives(locator_1, shapes=True) or []
-        for shape in shapes:
-            if cmds.nodeType(shape) == "locator":
-                cmds.setAttr(f"{shape}.overrideColorR", UI_COLORS["stage1"][0])
-                cmds.setAttr(f"{shape}.overrideColorG", UI_COLORS["stage1"][1])
-                cmds.setAttr(f"{shape}.overrideColorB", UI_COLORS["stage1"][2])
+    # Update null_grp_1 color to inactive (orange)
+    _set_null_color(null_grp_1, UI_COLORS["stage1"])
 
-    return True, f"Pivot OFF. '{control}' stays in place. Key if needed."
+    return True, f"Pivot OFF. '{control}' is now free to move. Key if needed."
 
 
 # =============================================================================
@@ -749,7 +749,7 @@ def _create_auto_key_callback(settings_node: str):
 
 
 def setup_auto_key(settings_node: str) -> None:
-    """Set up scriptJobs to auto-key the control when locator_1 is transformed."""
+    """Set up scriptJobs to auto-key the control when null_group_1 is transformed."""
     global _auto_key_jobs
 
     # Clean up any existing jobs for this rig
@@ -759,9 +759,9 @@ def setup_auto_key(settings_node: str) -> None:
         return
 
     nodes = get_rig_nodes(settings_node)
-    locator_1 = nodes["locator_1"]
+    null_grp_1 = nodes["null_grp_1"]
 
-    if not locator_1 or not cmds.objExists(locator_1):
+    if not null_grp_1 or not cmds.objExists(null_grp_1):
         return
 
     # Create callback function
@@ -770,7 +770,7 @@ def setup_auto_key(settings_node: str) -> None:
     # Set up scriptJobs for BOTH translation AND rotation attribute changes
     job_ids = []
     for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
-        attr_path = f"{locator_1}.{attr}"
+        attr_path = f"{null_grp_1}.{attr}"
         if cmds.objExists(attr_path):
             job_id = cmds.scriptJob(
                 attributeChange=[attr_path, callback],
@@ -811,15 +811,19 @@ def delete_pivot_rig(settings_node: str) -> Tuple[bool, str]:
     if is_rig_active(settings_node):
         toggle_off(settings_node)
 
-    # Delete null_GRP (deletes all children)
-    null_grp = nodes["null_grp"]
-    if null_grp and cmds.objExists(null_grp):
-        cmds.delete(null_grp)
+    # Delete null_group_2 (which parents null_group_1 and everything else)
+    null_grp_2 = nodes["null_grp_2"]
+    if null_grp_2 and cmds.objExists(null_grp_2):
+        cmds.delete(null_grp_2)
 
-    # Clean up orphaned nodes
-    for node_name in [nodes["locator_1"], nodes["locator_2"], settings_node]:
-        if node_name and cmds.objExists(node_name):
-            cmds.delete(node_name)
+    # Delete null_group_1 if it wasn't parented under null_group_2
+    null_grp_1 = nodes["null_grp_1"]
+    if null_grp_1 and cmds.objExists(null_grp_1):
+        cmds.delete(null_grp_1)
+
+    # Clean up orphaned settings node
+    if cmds.objExists(settings_node):
+        cmds.delete(settings_node)
 
     # Remove any remaining constraints
     if control and cmds.objExists(control):
@@ -831,17 +835,17 @@ def delete_pivot_rig(settings_node: str) -> Tuple[bool, str]:
     return True, f"Deleted pivot rig for '{control}'."
 
 
-def delete_pending_pivot(locator_1: str) -> Tuple[bool, str]:
-    """Delete a pending (Stage 1) pivot locator."""
-    if not cmds.objExists(locator_1):
-        return False, "Locator not found."
+def delete_pending_pivot(null_grp_1: str) -> Tuple[bool, str]:
+    """Delete a pending (Stage 1) pivot null."""
+    if not cmds.objExists(null_grp_1):
+        return False, "Pivot null not found."
 
     control = ""
-    if cmds.attributeQuery("targetControl", node=locator_1, exists=True):
-        control = cmds.getAttr(f"{locator_1}.targetControl")
+    if cmds.attributeQuery("targetControl", node=null_grp_1, exists=True):
+        control = cmds.getAttr(f"{null_grp_1}.targetControl")
 
-    cmds.delete(locator_1)
-    return True, f"Deleted pending pivot locator for '{control}'."
+    cmds.delete(null_grp_1)
+    return True, f"Deleted pending pivot null for '{control}'."
 
 
 # =============================================================================
@@ -893,7 +897,7 @@ def show() -> None:
     title_col = cmds.columnLayout(adjustableColumn=True)
     cmds.text(label="Temp Pivot Tool", font="boldLabelFont", align="left", height=22)
     cmds.text(
-        label="Two-stage pivot system for animation",
+        label="Two-null pivot system for animation",
         align="left",
         font="smallPlainLabelFont",
         height=16
@@ -905,9 +909,9 @@ def show() -> None:
 
     cmds.text(
         label="1. Select control, click 'Create Pivot Locator'\n"
-              "2. Move locator_1 to desired pivot point\n"
+              "2. Use 'Adjust Pivot' (D key) to set pivot point\n"
               "3. Click 'Complete Setup'\n"
-              "4. Rotate locator_1, Key, Toggle OFF when done",
+              "4. Rotate pivot null, Key, Toggle OFF when done",
         align="left",
         wordWrap=True,
         height=60,
@@ -956,7 +960,7 @@ def show() -> None:
     # ==========================================
 
     cmds.frameLayout(
-        label="Stage 1: Create Pivot Locator",
+        label="Stage 1: Create Pivot Null",
         collapsable=True,
         collapse=False,
         marginWidth=8,
@@ -966,8 +970,8 @@ def show() -> None:
     cmds.columnLayout(adjustableColumn=True, rowSpacing=6)
 
     cmds.text(
-        label="Select a control, then create the pivot locator.\n"
-              "Move it to your desired pivot position:",
+        label="Select a control, then create the pivot null.\n"
+              "Use 'Adjust Pivot' tool to set pivot position:",
         align="left",
         font="smallPlainLabelFont",
         height=32
@@ -1000,8 +1004,8 @@ def show() -> None:
     cmds.columnLayout(adjustableColumn=True, rowSpacing=6)
 
     cmds.text(
-        label="After positioning locator_1, complete the setup.\n"
-              "This creates the driver and constraint:",
+        label="After setting the pivot point, complete the setup.\n"
+              "This creates the constraint to the control:",
         align="left",
         font="smallPlainLabelFont",
         height=32
@@ -1057,7 +1061,7 @@ def show() -> None:
     )
 
     select_pivot_btn = cmds.button(
-        label="Select Pivot (locator_1)",
+        label="Select Pivot",
         height=26,
         annotation=TOOLTIPS["select_pivot_btn"]
     )
@@ -1203,25 +1207,25 @@ def show() -> None:
         sel = cmds.ls(selection=True, type="transform") or []
 
         selected_settings = None
-        pending_locator = None
+        pending_pivot = None
 
         for item in sel:
-            # Check for locator_1 (pivot)
-            if LOCATOR_1_SUFFIX in item:
+            # Check for null_grp_1 (pivot)
+            if NULL_GRP_1_SUFFIX in item:
                 # Check if it's pending or complete
                 if cmds.attributeQuery("setupComplete", node=item, exists=True):
                     if cmds.getAttr(f"{item}.setupComplete"):
                         # Complete - find settings
-                        prefix = item.replace(LOCATOR_1_SUFFIX, "")
+                        prefix = item.replace(NULL_GRP_1_SUFFIX, "")
                         possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
                         if cmds.objExists(possible_settings):
                             selected_settings = possible_settings
                     else:
-                        pending_locator = item
+                        pending_pivot = item
                 break
-            # Check for locator_2
-            if LOCATOR_2_SUFFIX in item:
-                prefix = item.replace(LOCATOR_2_SUFFIX, "")
+            # Check for null_grp_2 (anchor)
+            if NULL_GRP_2_SUFFIX in item:
+                prefix = item.replace(NULL_GRP_2_SUFFIX, "")
                 possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
                 if cmds.objExists(possible_settings):
                     selected_settings = possible_settings
@@ -1234,7 +1238,7 @@ def show() -> None:
             # Check for pending pivot
             pending = get_pending_pivot_for_control(item)
             if pending:
-                pending_locator = pending
+                pending_pivot = pending
 
         if selected_settings:
             nodes = get_rig_nodes(selected_settings)
@@ -1245,9 +1249,9 @@ def show() -> None:
                 cmds.button(state_indicator, edit=True, label="ON", backgroundColor=UI_COLORS["success"])
             else:
                 cmds.button(state_indicator, edit=True, label="OFF", backgroundColor=UI_COLORS["stage1"])
-        elif pending_locator:
-            if cmds.attributeQuery("targetControl", node=pending_locator, exists=True):
-                control = cmds.getAttr(f"{pending_locator}.targetControl")
+        elif pending_pivot:
+            if cmds.attributeQuery("targetControl", node=pending_pivot, exists=True):
+                control = cmds.getAttr(f"{pending_pivot}.targetControl")
                 cmds.text(selection_text, edit=True, label=f"Pending: {control}")
             cmds.button(state_indicator, edit=True, label="STAGE1", backgroundColor=UI_COLORS["stage1"])
         elif sel:
@@ -1258,21 +1262,21 @@ def show() -> None:
             cmds.button(state_indicator, edit=True, label="READY", backgroundColor=UI_COLORS["off_state"])
 
     def get_current_context():
-        """Get current rig settings or pending locator."""
+        """Get current rig settings or pending pivot."""
         sel = cmds.ls(selection=True, type="transform") or []
 
         for item in sel:
-            if LOCATOR_1_SUFFIX in item:
+            if NULL_GRP_1_SUFFIX in item:
                 if cmds.attributeQuery("setupComplete", node=item, exists=True):
                     if cmds.getAttr(f"{item}.setupComplete"):
-                        prefix = item.replace(LOCATOR_1_SUFFIX, "")
+                        prefix = item.replace(NULL_GRP_1_SUFFIX, "")
                         possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
                         if cmds.objExists(possible_settings):
                             return ("rig", possible_settings)
                     else:
                         return ("pending", item)
-            if LOCATOR_2_SUFFIX in item:
-                prefix = item.replace(LOCATOR_2_SUFFIX, "")
+            if NULL_GRP_2_SUFFIX in item:
+                prefix = item.replace(NULL_GRP_2_SUFFIX, "")
                 possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
                 if cmds.objExists(possible_settings):
                     return ("rig", possible_settings)
@@ -1296,25 +1300,25 @@ def show() -> None:
             return
 
         control = controls[0]
-        success, msg, loc = create_pivot_locator(control)
+        success, msg, pivot = create_pivot_locator(control)
         log_message(msg, "success" if success else "warning")
         refresh_rig_list()
         update_status()
 
     def on_complete_setup(*args):
         ctx_type, ctx_node = get_current_context()
-        locator_to_select = None
+        pivot_to_select = None
 
         if ctx_type == "pending":
             success, msg, settings = complete_setup(ctx_node)
             log_message(msg, "success" if success else "error")
             if success and settings:
                 nodes = get_rig_nodes(settings)
-                locator_to_select = nodes["locator_1"]
+                pivot_to_select = nodes["null_grp_1"]
         elif ctx_type == "rig":
             log_message("Setup already complete. Use Toggle to activate.", "warning")
         else:
-            # Try to find pending locator for selected control
+            # Try to find pending pivot for selected control
             sel = cmds.ls(selection=True, type="transform") or []
             for item in sel:
                 pending = get_pending_pivot_for_control(item)
@@ -1323,21 +1327,21 @@ def show() -> None:
                     log_message(msg, "success" if success else "error")
                     if success and settings:
                         nodes = get_rig_nodes(settings)
-                        locator_to_select = nodes["locator_1"]
+                        pivot_to_select = nodes["null_grp_1"]
                     refresh_rig_list()
                     update_status()
-                    # Ensure locator_1 is selected after UI updates
-                    if locator_to_select and cmds.objExists(locator_to_select):
-                        cmds.evalDeferred(lambda loc=locator_to_select: cmds.select(loc))
+                    # Ensure pivot is selected after UI updates
+                    if pivot_to_select and cmds.objExists(pivot_to_select):
+                        cmds.evalDeferred(lambda loc=pivot_to_select: cmds.select(loc))
                     return
 
-            log_message("No pending pivot locator found. Create one first.", "warning")
+            log_message("No pending pivot null found. Create one first.", "warning")
 
         refresh_rig_list()
         update_status()
-        # Ensure locator_1 is selected after UI updates
-        if locator_to_select and cmds.objExists(locator_to_select):
-            cmds.evalDeferred(lambda loc=locator_to_select: cmds.select(loc))
+        # Ensure pivot is selected after UI updates
+        if pivot_to_select and cmds.objExists(pivot_to_select):
+            cmds.evalDeferred(lambda loc=pivot_to_select: cmds.select(loc))
 
     def on_toggle(*args):
         ctx_type, ctx_node = get_current_context()
@@ -1382,15 +1386,15 @@ def show() -> None:
         ctx_type, ctx_node = get_current_context()
         if ctx_type == "rig":
             nodes = get_rig_nodes(ctx_node)
-            loc1 = nodes["locator_1"]
-            if loc1 and cmds.objExists(loc1):
-                cmds.select(loc1)
-                log_message(f"Selected: {loc1}", "info")
+            pivot = nodes["null_grp_1"]
+            if pivot and cmds.objExists(pivot):
+                cmds.select(pivot)
+                log_message(f"Selected: {pivot}", "info")
         elif ctx_type == "pending":
             cmds.select(ctx_node)
             log_message(f"Selected: {ctx_node}", "info")
         else:
-            log_message("No pivot locator found.", "warning")
+            log_message("No pivot null found.", "warning")
 
     def on_select_control(*args):
         ctx_type, ctx_node = get_current_context()
@@ -1410,19 +1414,19 @@ def show() -> None:
             log_message("No control found.", "warning")
 
     def on_list_select(*args):
-        """Handle selection in the rig list - select the locator in viewport."""
+        """Handle selection in the rig list - select the pivot in viewport."""
         selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
         if selected_items:
             control_name = selected_items[0].split(" [")[0]
             settings = get_rig_for_control(control_name)
             if settings:
                 nodes = get_rig_nodes(settings)
-                loc1 = nodes["locator_1"]
-                if loc1 and cmds.objExists(loc1):
+                pivot = nodes["null_grp_1"]
+                if pivot and cmds.objExists(pivot):
                     # Set flag to prevent refresh from wiping out our list selection
                     _skip_list_refresh[0] = True
                     try:
-                        cmds.select(loc1)
+                        cmds.select(pivot)
                     finally:
                         # Use evalDeferred to reset flag after Maya processes the selection
                         cmds.evalDeferred(lambda: _skip_list_refresh.__setitem__(0, False))
