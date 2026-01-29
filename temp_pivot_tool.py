@@ -267,17 +267,20 @@ def _set_null_color(null_grp: str, color: Tuple[float, float, float]) -> None:
 
 def _enter_pivot_adjust_mode(node: str) -> None:
     """
-    Enter pivot adjust mode with the translate tool active on the given node.
+    Enter custom pivot editing mode with the translate tool active on the given node.
 
-    This selects the node, activates the Move tool, and enters pivot editing mode
-    so the user can immediately adjust the pivot position.
+    This selects the node, activates the Move tool, and enters custom pivot editing
+    mode (equivalent to pressing D or Insert key) so the user can immediately
+    adjust the pivot position.
+
+    See: https://help.autodesk.com/view/MAYAUL/2026/ENU/?guid=GUID-6BCE41D8-07CB-4A99-99CD-1D3986896157
     """
     # Ensure the node is selected
     cmds.select(node, replace=True)
 
-    # Activate the Move tool and enter pivot edit mode
-    # Using MEL for reliable pivot mode activation
-    mel.eval('MoveTool; manipMoveContext -e -mode 6 Move;')
+    # Activate the Move tool and enter custom pivot editing mode
+    # ctxEditMode is the MEL command equivalent to pressing D or Insert key
+    mel.eval('MoveTool; ctxEditMode;')
 
 
 # -----------------------------
