@@ -52,6 +52,7 @@ LOCATOR_1_SUFFIX = f"_{TOOL_PREFIX}_locator_1"  # PIVOT - user positions this
 LOCATOR_2_SUFFIX = f"_{TOOL_PREFIX}_locator_2"  # DRIVER - constrains control
 SETTINGS_SUFFIX = f"_{TOOL_PREFIX}_settings"
 CONSTRAINT_SUFFIX = f"_{TOOL_PREFIX}_parentConstraint"
+META_SUFFIX = f"_{TOOL_PREFIX}_meta"
 
 # Auto-key scriptJob storage (keyed by settings node name)
 _auto_key_jobs: Dict[str, List[int]] = {}
@@ -205,6 +206,18 @@ def _add_bool_attr(node: str, attr: str, value: bool = False) -> None:
     cmds.setAttr(f"{node}.{attr}", value)
 
 
+def _add_message_attr(node: str, attr: str) -> None:
+    """Add a message attribute if it doesn't exist."""
+    if not cmds.attributeQuery(attr, node=node, exists=True):
+        cmds.addAttr(node, longName=attr, attributeType="message")
+
+
+def _add_matrix_attr(node: str, attr: str) -> None:
+    """Add a matrix attribute if it doesn't exist."""
+    if not cmds.attributeQuery(attr, node=node, exists=True):
+        cmds.addAttr(node, longName=attr, attributeType="matrix")
+
+
 def _add_double_array_attr(node: str, attr: str) -> None:
     """Add a doubleArray attribute if it doesn't exist."""
     if not cmds.attributeQuery(attr, node=node, exists=True):
@@ -271,12 +284,115 @@ def _set_double_array_attr(node: str, attr: str, values: List[float]) -> None:
     cmds.setAttr(f"{node}.{attr}", values, type="doubleArray")
 
 
+def _get_matrix_attr(node: str, attr: str) -> Optional[List[float]]:
+    """Get a matrix attribute as a 16-float list."""
+    if not cmds.attributeQuery(attr, node=node, exists=True):
+        return None
+    value = cmds.getAttr(f"{node}.{attr}")
+    if not value:
+        return None
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    return list(value)
+
+
+def _set_matrix_attr(node: str, attr: str, matrix: List[float]) -> None:
+    """Set a matrix attribute from a 16-float list."""
+    _add_matrix_attr(node, attr)
+    cmds.setAttr(f"{node}.{attr}", *matrix, type="matrix")
+
+
 def _store_pivot_offset_rig_space(settings_node: str, null_grp: str, locator_2: str) -> None:
     """Store locator_2 offset relative to null_grp in rig space."""
     null_world = _get_world_matrix(null_grp)
     locator_world = _get_world_matrix(locator_2)
     pivot_offset = _multiply_matrices(_inverse_matrix(null_world), locator_world)
     _set_double_array_attr(settings_node, "pivotOffsetRigMtx", pivot_offset)
+
+
+def _find_meta_for_control(control: str) -> Optional[str]:
+    """Find the meta network node connected to a control."""
+    connections = cmds.listConnections(
+        f"{control}.message",
+        source=False,
+        destination=True,
+        type="network"
+    ) or []
+    for node in connections:
+        if cmds.attributeQuery("targetControl", node=node, exists=True):
+            linked = cmds.listConnections(
+                f"{node}.targetControl",
+                source=True,
+                destination=False
+            ) or []
+            if control in linked:
+                return node
+    return None
+
+
+def _create_meta_node(
+    control: str,
+    settings_node: str,
+    null_grp: str,
+    locator_1: str,
+    locator_2: str
+) -> str:
+    """Create and wire a meta node for persistent pivot storage."""
+    prefix = _sanitize_name(control)
+    meta_node = cmds.createNode("network", name=f"{prefix}{META_SUFFIX}")
+    _add_message_attr(meta_node, "targetControl")
+    _add_message_attr(meta_node, "rigRoot")
+    _add_message_attr(meta_node, "pivotHandle")
+    _add_message_attr(meta_node, "driver")
+    _add_message_attr(meta_node, "settingsNode")
+    _add_bool_attr(meta_node, "enabled", True)
+    _add_matrix_attr(meta_node, "pivotOffsetMatrix")
+    _add_matrix_attr(meta_node, "lastKnownTargetWorldMatrix")
+
+    cmds.connectAttr(f"{control}.message", f"{meta_node}.targetControl", force=True)
+    cmds.connectAttr(f"{null_grp}.message", f"{meta_node}.rigRoot", force=True)
+    cmds.connectAttr(f"{locator_1}.message", f"{meta_node}.pivotHandle", force=True)
+    cmds.connectAttr(f"{locator_2}.message", f"{meta_node}.driver", force=True)
+    cmds.connectAttr(f"{settings_node}.message", f"{meta_node}.settingsNode", force=True)
+    return meta_node
+
+
+def _get_or_create_meta(
+    control: str,
+    settings_node: str,
+    null_grp: str,
+    locator_1: str,
+    locator_2: str
+) -> str:
+    """Find or create the meta node for a control."""
+    meta_node = _find_meta_for_control(control)
+    if meta_node and cmds.objExists(meta_node):
+        return meta_node
+    return _create_meta_node(control, settings_node, null_grp, locator_1, locator_2)
+
+
+def store_pivot_offset(meta_node: str, control: str, pivot_handle: str) -> None:
+    """
+    Store pivot offset relative to the target control.
+
+    pivotOffset = inverse(targetWorld) * pivotWorld
+    """
+    control_world = _get_world_matrix(control)
+    pivot_world = _get_world_matrix(pivot_handle)
+    offset = _multiply_matrices(_inverse_matrix(control_world), pivot_world)
+    _set_matrix_attr(meta_node, "pivotOffsetMatrix", offset)
+    _set_matrix_attr(meta_node, "lastKnownTargetWorldMatrix", control_world)
+
+
+def restore_pivot_from_offset(meta_node: str, control: str, pivot_handle: str) -> None:
+    """Restore pivot handle world matrix from stored control-space offset."""
+    control_world = _get_world_matrix(control)
+    offset = _get_matrix_attr(meta_node, "pivotOffsetMatrix")
+    if not offset or len(offset) != 16:
+        offset = _matrix_to_list(om.MMatrix())
+        _set_matrix_attr(meta_node, "pivotOffsetMatrix", offset)
+    pivot_world = _multiply_matrices(control_world, offset)
+    _set_world_matrix(pivot_handle, pivot_world)
 
 
 def _store_pivot_local_matrices(settings_node: str, locator_1: str, locator_2: str) -> None:
@@ -608,6 +724,8 @@ def complete_setup(locator_1: str) -> Tuple[bool, str, Optional[str]]:
     _add_bool_attr(settings_node, "isActive", True)
     _store_pivot_offset_rig_space(settings_node, null_grp, locator_2)
     _store_pivot_local_matrices(settings_node, locator_1, locator_2)
+    meta_node = _get_or_create_meta(control, settings_node, null_grp, locator_1, locator_2)
+    store_pivot_offset(meta_node, control, locator_1)
 
     # Parent settings under null_grp
     cmds.parent(settings_node, null_grp)
@@ -680,37 +798,11 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     if len(selection) != 1 or selection[0] != control:
         cmds.warning(f"Toggle ON expects '{control}' selected. Proceeding with stored rig target.")
 
-    # =========================================================================
-    # Match null_GRP to control's world position and rotation
-    # Using world matrix alignment to follow the control's current transform
-    # =========================================================================
-    control_world = _get_world_matrix(control)
-    _set_world_matrix(null_grp, control_world)
-
-    # =========================================================================
-    # Restore locator local matrices to preserve pivot offsets
-    # =========================================================================
-    loc1_local, loc2_local = _get_pivot_local_matrices(settings_node, locator_1, locator_2)
-    _set_local_matrix(locator_1, loc1_local)
-    _set_local_matrix(locator_2, loc2_local)
-
-    # =========================================================================
-    # Recreate parentConstraint: locator_2 → control
-    # =========================================================================
-    prefix = _sanitize_name(control)
-    constraint_name = f"{prefix}{CONSTRAINT_SUFFIX}"
-
-    if cmds.objExists(constraint_name):
-        cmds.delete(constraint_name)
-
-    constraint = cmds.parentConstraint(
-        locator_2, control,
-        maintainOffset=True,
-        name=constraint_name
-    )[0]
+    enable_success, enable_msg = enable_temp_pivot(settings_node)
+    if not enable_success:
+        return False, enable_msg
 
     # Update settings
-    cmds.setAttr(f"{settings_node}.constraintName", constraint, type="string")
     cmds.setAttr(f"{settings_node}.isActive", True)
 
     # =========================================================================
@@ -732,7 +824,7 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     # Select locator_1
     cmds.select(locator_1)
 
-    return True, f"Pivot ON. Rotate locator_1 to orbit '{control}'. Auto-key enabled."
+    return True, enable_msg
 
 
 # =============================================================================
@@ -761,42 +853,14 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     if not is_rig_active(settings_node):
         return False, "Rig is not active."
 
+    disable_success, disable_msg = disable_temp_pivot(settings_node)
+    if not disable_success:
+        return False, disable_msg
+
     nodes = get_rig_nodes(settings_node)
     control = nodes["control"]
-    constraint = nodes["constraint"]
-    null_grp = nodes["null_grp"]
     locator_1 = nodes["locator_1"]
-    locator_2 = nodes["locator_2"]
-
-    # =========================================================================
-    # Clean up auto-key scriptJobs
-    # =========================================================================
-    cleanup_auto_key(settings_node)
-
-    # =========================================================================
-    # Store pivot offset in rig space before turning off
-    # =========================================================================
-    if null_grp and locator_2 and cmds.objExists(null_grp) and cmds.objExists(locator_2):
-        _store_pivot_offset_rig_space(settings_node, null_grp, locator_2)
-    if locator_1 and locator_2 and cmds.objExists(locator_1) and cmds.objExists(locator_2):
-        _store_pivot_local_matrices(settings_node, locator_1, locator_2)
-
-    # =========================================================================
-    # Delete the constraint
-    # =========================================================================
-    if constraint and cmds.objExists(constraint):
-        cmds.delete(constraint)
-
-    # Also clean any other constraints from this tool
-    if control and cmds.objExists(control):
-        constraints = cmds.listRelatives(control, type="parentConstraint") or []
-        for c in constraints:
-            if CONSTRAINT_SUFFIX in c or TOOL_PREFIX in c:
-                cmds.delete(c)
-
-    # Clear constraint reference and set inactive
-    cmds.setAttr(f"{settings_node}.constraintName", "", type="string")
-    cmds.setAttr(f"{settings_node}.isActive", False)
+    null_grp = nodes["null_grp"]
 
     # =========================================================================
     # Hide visibility
@@ -813,7 +877,7 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
                 cmds.setAttr(f"{shape}.overrideColorG", UI_COLORS["stage1"][1])
                 cmds.setAttr(f"{shape}.overrideColorB", UI_COLORS["stage1"][2])
 
-    return True, f"Pivot OFF. '{control}' stays in place. Key if needed."
+    return True, disable_msg
 
 
 # =============================================================================
@@ -831,6 +895,133 @@ def toggle_pivot(settings_node: str) -> Tuple[bool, str, bool]:
     else:
         success, msg = toggle_on(settings_node)
         return success, msg, True
+
+
+# =============================================================================
+# Rig Build/Enable/Disable Helpers
+# =============================================================================
+
+def build_rig(settings_node: str) -> Tuple[bool, str, Dict[str, Optional[str]]]:
+    """
+    Ensure rig nodes exist; rebuild minimal pieces if possible.
+
+    Returns:
+        (success, message, nodes)
+    """
+    nodes = get_rig_nodes(settings_node)
+    control = nodes["control"]
+    if not control or not cmds.objExists(control):
+        return False, "Control not found for rig.", nodes
+
+    locator_1 = nodes["locator_1"]
+    locator_2 = nodes["locator_2"]
+    null_grp = nodes["null_grp"]
+
+    if not locator_1 or not cmds.objExists(locator_1):
+        return False, "Locator_1 missing; rebuild requires Stage 1.", nodes
+
+    if not null_grp or not cmds.objExists(null_grp):
+        null_grp = cmds.group(empty=True, name=f"{_sanitize_name(control)}{NULL_GRP_SUFFIX}")
+        _match_transform_world(null_grp, control)
+        cmds.parent(locator_1, null_grp)
+        _add_string_attr(settings_node, "nullGrp", null_grp)
+        nodes["null_grp"] = null_grp
+
+    if not locator_2 or not cmds.objExists(locator_2):
+        locator_2 = cmds.spaceLocator(name=f"{_sanitize_name(control)}{LOCATOR_2_SUFFIX}")[0]
+        _match_transform_world(locator_2, control)
+        cmds.parent(locator_2, locator_1)
+        _add_string_attr(settings_node, "locator2", locator_2)
+        nodes["locator_2"] = locator_2
+
+    return True, "Rig ready.", nodes
+
+
+def enable_temp_pivot(settings_node: str) -> Tuple[bool, str]:
+    """
+    Enable the temp pivot rig without popping the control.
+
+    This aligns the rig root to the control, restores the pivot handle in control
+    space, and recreates the driver constraint.
+    """
+    build_success, build_msg, nodes = build_rig(settings_node)
+    if not build_success:
+        return False, build_msg
+
+    control = nodes["control"]
+    null_grp = nodes["null_grp"]
+    locator_1 = nodes["locator_1"]
+    locator_2 = nodes["locator_2"]
+
+    if not control or not null_grp or not locator_1 or not locator_2:
+        return False, "Rig nodes missing; cannot enable."
+
+    control_world = _get_world_matrix(control)
+    _set_world_matrix(null_grp, control_world)
+
+    meta_node = _get_or_create_meta(control, settings_node, null_grp, locator_1, locator_2)
+    restore_pivot_from_offset(meta_node, control, locator_1)
+
+    # Keep driver aligned to the control so maintainOffset creates no pop.
+    _set_world_matrix(locator_2, control_world)
+
+    prefix = _sanitize_name(control)
+    constraint_name = f"{prefix}{CONSTRAINT_SUFFIX}"
+    if cmds.objExists(constraint_name):
+        cmds.delete(constraint_name)
+
+    constraint = cmds.parentConstraint(
+        locator_2, control,
+        maintainOffset=True,
+        name=constraint_name
+    )[0]
+
+    cmds.setAttr(f"{settings_node}.constraintName", constraint, type="string")
+    cmds.setAttr(f"{settings_node}.isActive", True)
+    cmds.setAttr(f"{meta_node}.enabled", True)
+
+    return True, f"Pivot ON. Rotate locator_1 to orbit '{control}'. Auto-key enabled."
+
+
+def disable_temp_pivot(settings_node: str) -> Tuple[bool, str]:
+    """
+    Disable the temp pivot rig without changing the control's world transform.
+    """
+    nodes = get_rig_nodes(settings_node)
+    control = nodes["control"]
+    constraint = nodes["constraint"]
+    null_grp = nodes["null_grp"]
+    locator_1 = nodes["locator_1"]
+    locator_2 = nodes["locator_2"]
+
+    cleanup_auto_key(settings_node)
+
+    if control and locator_1 and cmds.objExists(control) and cmds.objExists(locator_1):
+        meta_node = _find_meta_for_control(control)
+        if not meta_node and null_grp and locator_2:
+            meta_node = _get_or_create_meta(control, settings_node, null_grp, locator_1, locator_2)
+        if meta_node:
+            store_pivot_offset(meta_node, control, locator_1)
+            cmds.setAttr(f"{meta_node}.enabled", False)
+
+    if null_grp and locator_2 and cmds.objExists(null_grp) and cmds.objExists(locator_2):
+        _store_pivot_offset_rig_space(settings_node, null_grp, locator_2)
+    if locator_1 and locator_2 and cmds.objExists(locator_1) and cmds.objExists(locator_2):
+        _store_pivot_local_matrices(settings_node, locator_1, locator_2)
+
+    if constraint and cmds.objExists(constraint):
+        cmds.delete(constraint)
+
+    if control and cmds.objExists(control):
+        constraints = cmds.listRelatives(control, type="parentConstraint") or []
+        for c in constraints:
+            if CONSTRAINT_SUFFIX in c or TOOL_PREFIX in c:
+                cmds.delete(c)
+
+    cmds.setAttr(f"{settings_node}.constraintName", "", type="string")
+    cmds.setAttr(f"{settings_node}.isActive", False)
+
+    return True, f"Pivot OFF. '{control}' stays in place. Key if needed."
 
 
 # =============================================================================
