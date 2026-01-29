@@ -212,6 +212,20 @@ def _create_visual_null(name: str, color: Tuple[float, float, float], size: floa
     Returns:
         The name of the created null group
     """
+    # Clean up any existing nodes with conflicting names first
+    # This prevents Maya auto-renaming and creating orphaned nodes
+    nodes_to_clean = [
+        name,
+        f"{name}_ringX", f"{name}_ringY", f"{name}_ringZ",
+        f"{name}_loc"
+    ]
+    for node_name in nodes_to_clean:
+        if cmds.objExists(node_name):
+            try:
+                cmds.delete(node_name)
+            except Exception:
+                pass
+
     # Create the null group
     null_grp = cmds.group(empty=True, name=name)
 
@@ -221,36 +235,50 @@ def _create_visual_null(name: str, color: Tuple[float, float, float], size: floa
         ("Y", (0.3, 1, 0.3), (0, 1, 0)),
         ("Z", (0.3, 0.5, 1), (0, 0, 1))
     ]:
+        temp_name = f"{name}_ring{axis}"
         circle = cmds.circle(
-            name=f"{name}_ring{axis}",
+            name=temp_name,
             normal=normal,
             radius=0.5 * size,
             degree=3,
             sections=24,
             constructionHistory=False
         )[0]
-        circle_shape = cmds.listRelatives(circle, shapes=True)[0]
-        cmds.setAttr(f"{circle_shape}.overrideEnabled", 1)
-        cmds.setAttr(f"{circle_shape}.overrideRGBColors", 1)
-        cmds.setAttr(f"{circle_shape}.overrideColorR", axis_color[0])
-        cmds.setAttr(f"{circle_shape}.overrideColorG", axis_color[1])
-        cmds.setAttr(f"{circle_shape}.overrideColorB", axis_color[2])
-        cmds.parent(circle_shape, null_grp, shape=True, relative=True)
-        cmds.delete(circle)
+
+        # Get the shape from the actual created node (in case Maya renamed it)
+        shapes = cmds.listRelatives(circle, shapes=True) or []
+        if shapes:
+            circle_shape = shapes[0]
+            cmds.setAttr(f"{circle_shape}.overrideEnabled", 1)
+            cmds.setAttr(f"{circle_shape}.overrideRGBColors", 1)
+            cmds.setAttr(f"{circle_shape}.overrideColorR", axis_color[0])
+            cmds.setAttr(f"{circle_shape}.overrideColorG", axis_color[1])
+            cmds.setAttr(f"{circle_shape}.overrideColorB", axis_color[2])
+            cmds.parent(circle_shape, null_grp, shape=True, relative=True)
+
+        # Delete the transform node (use the actual created name)
+        if cmds.objExists(circle):
+            cmds.delete(circle)
 
     # Add a center locator shape for selection clarity
-    loc = cmds.spaceLocator(name=f"{name}_loc")[0]
-    loc_shape = cmds.listRelatives(loc, shapes=True)[0]
-    cmds.setAttr(f"{loc_shape}.overrideEnabled", 1)
-    cmds.setAttr(f"{loc_shape}.overrideRGBColors", 1)
-    cmds.setAttr(f"{loc_shape}.overrideColorR", color[0])
-    cmds.setAttr(f"{loc_shape}.overrideColorG", color[1])
-    cmds.setAttr(f"{loc_shape}.overrideColorB", color[2])
-    cmds.setAttr(f"{loc_shape}.localScaleX", 0.3 * size)
-    cmds.setAttr(f"{loc_shape}.localScaleY", 0.3 * size)
-    cmds.setAttr(f"{loc_shape}.localScaleZ", 0.3 * size)
-    cmds.parent(loc_shape, null_grp, shape=True, relative=True)
-    cmds.delete(loc)
+    loc_temp_name = f"{name}_loc"
+    loc = cmds.spaceLocator(name=loc_temp_name)[0]
+    loc_shapes = cmds.listRelatives(loc, shapes=True) or []
+    if loc_shapes:
+        loc_shape = loc_shapes[0]
+        cmds.setAttr(f"{loc_shape}.overrideEnabled", 1)
+        cmds.setAttr(f"{loc_shape}.overrideRGBColors", 1)
+        cmds.setAttr(f"{loc_shape}.overrideColorR", color[0])
+        cmds.setAttr(f"{loc_shape}.overrideColorG", color[1])
+        cmds.setAttr(f"{loc_shape}.overrideColorB", color[2])
+        cmds.setAttr(f"{loc_shape}.localScaleX", 0.3 * size)
+        cmds.setAttr(f"{loc_shape}.localScaleY", 0.3 * size)
+        cmds.setAttr(f"{loc_shape}.localScaleZ", 0.3 * size)
+        cmds.parent(loc_shape, null_grp, shape=True, relative=True)
+
+    # Delete the locator transform (use the actual created name)
+    if cmds.objExists(loc):
+        cmds.delete(loc)
 
     return null_grp
 
@@ -654,13 +682,24 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
             cmds.delete(c)
 
     prefix = _sanitize_name(control)
+    expected_anchor_name = f"{prefix}{NULL_GRP_2_SUFFIX}"
 
     # =========================================================================
     # Create null_group_2 if it doesn't exist (first toggle OFF)
     # =========================================================================
-    if not null_grp_2 or not cmds.objExists(null_grp_2):
+    # Check if we have a valid reference, or if the expected anchor already exists
+    anchor_exists = False
+    if null_grp_2 and cmds.objExists(null_grp_2):
+        anchor_exists = True
+    elif cmds.objExists(expected_anchor_name):
+        # The anchor exists but settings might have outdated reference
+        null_grp_2 = expected_anchor_name
+        cmds.setAttr(f"{settings_node}.nullGrp2", null_grp_2, type="string")
+        anchor_exists = True
+
+    if not anchor_exists:
         null_grp_2 = _create_visual_null(
-            f"{prefix}{NULL_GRP_2_SUFFIX}",
+            expected_anchor_name,
             UI_COLORS["stage2"],  # Blue for anchor
             size=1.2  # Slightly larger to distinguish
         )
