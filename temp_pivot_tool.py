@@ -524,10 +524,20 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     Reactivate the temp pivot system.
 
     Process:
-    1. Store the current pivot offset (rotatePivot in local space)
-    2. Realign the pivot group to the control's current world position
-    3. The pivot location is preserved because it's the rotatePivot of the group
+    1. Store the current pivot offset in LOCAL space (relative to group origin)
+    2. Realign the pivot group to the control's current world position/rotation
+    3. Restore the pivot offset in local space
     4. Create parentConstraint: pivot_grp → control
+
+    The pivot maintains its RELATIVE position to the control:
+    - If pivot was 2 units to the right of control, it stays 2 units to the right
+    - If control rotates, the pivot rotates with it (stays in control's local space)
+
+    Example:
+    - Control at (0,0,0), pivot at local offset (2,0,0) = world (2,0,0)
+    - Control moves to (5,0,0) and rotates 90° Y
+    - After toggle_on: group at (5,0,0) rot 90°Y, pivot local (2,0,0) = world (5,0,-2)
+    - The pivot is still 2 units away in the control's local X direction
 
     Args:
         settings_node: The settings node for this rig
