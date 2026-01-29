@@ -14,7 +14,7 @@ Hierarchy when ACTIVE (constraint ON):
 
 Workflow:
 1. Select control, click "Create Pivot Locator" (Stage 1)
-2. Use Maya's "Adjust Pivot" tool (D key or Insert) to position the pivot
+2. Tool automatically enters pivot adjust mode - move the pivot to desired position
 3. Click "Complete Setup" (Stage 2) - creates constraint to control
 4. Rotate null_group_1 - control orbits around the custom pivot point (auto-keys applied)
 5. Toggle OFF - creates null_group_2 as anchor, constraint deleted, control free to move
@@ -37,6 +37,7 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import maya.cmds as cmds
+import maya.mel as mel
 
 # -----------------------------
 # Constants
@@ -72,9 +73,9 @@ TOOLTIPS = {
     "create_pivot_btn": (
         "STAGE 1: Create the pivot null (null_group_1).\n\n"
         "1. Creates null_group_1 aligned to the control\n"
-        "2. Use Maya's 'Adjust Pivot' tool (D key or Insert)\n"
-        "   to move the pivot to your desired position\n"
-        "3. Then click 'Complete Setup' to finish"
+        "2. Automatically enters pivot adjust mode with Move tool\n"
+        "3. Move the pivot to your desired position\n"
+        "4. Then click 'Complete Setup' to finish"
     ),
     "complete_setup_btn": (
         "STAGE 2: Complete the pivot rig setup.\n\n"
@@ -264,6 +265,21 @@ def _set_null_color(null_grp: str, color: Tuple[float, float, float]) -> None:
             cmds.setAttr(f"{shape}.overrideColorB", color[2])
 
 
+def _enter_pivot_adjust_mode(node: str) -> None:
+    """
+    Enter pivot adjust mode with the translate tool active on the given node.
+
+    This selects the node, activates the Move tool, and enters pivot editing mode
+    so the user can immediately adjust the pivot position.
+    """
+    # Ensure the node is selected
+    cmds.select(node, replace=True)
+
+    # Activate the Move tool and enter pivot edit mode
+    # Using MEL for reliable pivot mode activation
+    mel.eval('MoveTool; manipMoveContext -e -mode 6 Move;')
+
+
 # -----------------------------
 # Rig Discovery Functions
 # -----------------------------
@@ -345,8 +361,9 @@ def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
     Process:
     1. Create null_group_1
     2. Align to the selected control using world matrix
-    3. User will use Maya's "Adjust Pivot" tool to set the pivot position
-    4. Then user clicks "Complete Setup" for Stage 2
+    3. Automatically enter pivot adjust mode with Move tool active
+    4. User moves the pivot to desired position
+    5. Then user clicks "Complete Setup" for Stage 2
 
     Args:
         control: The control to create a pivot for
@@ -395,10 +412,11 @@ def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
     _add_string_attr(null_grp_1, "targetControl", control)
     _add_bool_attr(null_grp_1, "setupComplete", False)
 
-    # Select the null so user can adjust its pivot
-    cmds.select(null_grp_1)
+    # Select the null and enter pivot adjust mode with translate tool
+    # Use evalDeferred to ensure proper initialization timing
+    cmds.evalDeferred(lambda: _enter_pivot_adjust_mode(null_grp_1))
 
-    return True, f"Stage 1 complete. Use 'Adjust Pivot' tool (D key) to set pivot position, then click 'Complete Setup'.", null_grp_1
+    return True, f"Stage 1 complete. Move the PIVOT to your desired position, then click 'Complete Setup'.", null_grp_1
 
 
 # =============================================================================
@@ -909,7 +927,7 @@ def show() -> None:
 
     cmds.text(
         label="1. Select control, click 'Create Pivot Locator'\n"
-              "2. Use 'Adjust Pivot' (D key) to set pivot point\n"
+              "2. Move the pivot to your desired position\n"
               "3. Click 'Complete Setup'\n"
               "4. Rotate pivot null, Key, Toggle OFF when done",
         align="left",
@@ -971,7 +989,7 @@ def show() -> None:
 
     cmds.text(
         label="Select a control, then create the pivot null.\n"
-              "Use 'Adjust Pivot' tool to set pivot position:",
+              "Move the pivot to your desired position:",
         align="left",
         font="smallPlainLabelFont",
         height=32
@@ -1292,6 +1310,9 @@ def show() -> None:
     # Button callbacks
 
     def on_create_pivot(*args):
+        # Force Maya to process any pending events and refresh selection
+        cmds.refresh(force=True)
+
         sel = cmds.ls(selection=True, type="transform") or []
         controls = [s for s in sel if TOOL_PREFIX not in s]
 
@@ -1302,8 +1323,10 @@ def show() -> None:
         control = controls[0]
         success, msg, pivot = create_pivot_locator(control)
         log_message(msg, "success" if success else "warning")
-        refresh_rig_list()
-        update_status()
+
+        # Defer UI updates to avoid interfering with pivot adjust mode activation
+        cmds.evalDeferred(refresh_rig_list)
+        cmds.evalDeferred(update_status)
 
     def on_complete_setup(*args):
         ctx_type, ctx_node = get_current_context()
