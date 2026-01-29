@@ -13,15 +13,20 @@ SIMPLIFIED WORKFLOW:
 7. Toggle ON - temp pivot realigns to control (pivot location preserved)
 8. Repeat as needed
 
+Hierarchy Structure:
+    align_grp (realigns to control on toggle)
+      └── pivot_grp (user adjusts pivot here, constrains control)
+            └── settings node
+
 Features:
-- Single group hierarchy (simpler!)
+- Two-group hierarchy preserves pivot offset naturally
 - Auto pivot mode with smart exit detection
 - Auto-key on toggle off
 - Edit Temp Pivot button to adjust pivot location
 
 Author: David Shepstone
 License: MIT
-Version: 6.0.0
+Version: 7.0.0
 """
 
 from __future__ import annotations
@@ -39,7 +44,8 @@ WINDOW_TITLE = "Temp Pivot Tool"
 TOOL_PREFIX = "TMP"
 
 # Node naming convention
-PIVOT_GRP_SUFFIX = f"_{TOOL_PREFIX}_tempPivot"
+ALIGN_GRP_SUFFIX = f"_{TOOL_PREFIX}_align"
+PIVOT_GRP_SUFFIX = f"_{TOOL_PREFIX}_pivot"
 SETTINGS_SUFFIX = f"_{TOOL_PREFIX}_settings"
 CONSTRAINT_SUFFIX = f"_{TOOL_PREFIX}_parentConstraint"
 
@@ -105,16 +111,6 @@ def _sanitize_name(name: str) -> str:
     safe = name.split(":")[-1]
     safe = safe.replace("|", "_").replace(" ", "_")
     return safe
-
-
-def _get_world_matrix(node: str) -> List[float]:
-    """Get the world matrix of a node."""
-    return cmds.xform(node, q=True, ws=True, matrix=True)
-
-
-def _set_world_matrix(node: str, matrix: List[float]) -> None:
-    """Set the world matrix of a node."""
-    cmds.xform(node, ws=True, matrix=matrix)
 
 
 def _match_transform_world(source: str, target: str) -> None:
@@ -207,6 +203,7 @@ def get_rig_nodes(settings_node: str) -> Dict[str, Optional[str]]:
     """Get all rig node names from a settings node."""
     result = {
         "settings": settings_node,
+        "align_grp": None,
         "pivot_grp": None,
         "control": None,
         "constraint": None,
@@ -215,6 +212,8 @@ def get_rig_nodes(settings_node: str) -> Dict[str, Optional[str]]:
     if not cmds.objExists(settings_node):
         return result
 
+    if cmds.attributeQuery("alignGrp", node=settings_node, exists=True):
+        result["align_grp"] = cmds.getAttr(f"{settings_node}.alignGrp") or None
     if cmds.attributeQuery("pivotGrp", node=settings_node, exists=True):
         result["pivot_grp"] = cmds.getAttr(f"{settings_node}.pivotGrp") or None
     if cmds.attributeQuery("targetControl", node=settings_node, exists=True):
@@ -249,7 +248,7 @@ def is_in_pivot_mode(settings_node: str) -> bool:
 
 def enter_pivot_mode(settings_node: str) -> Tuple[bool, str]:
     """
-    Enter pivot adjust mode for the temp pivot group.
+    Enter pivot adjust mode for the pivot group.
 
     This activates Maya's insert key (pivot) mode and sets up monitoring
     for when the user switches to translate/rotate mode.
@@ -259,6 +258,7 @@ def enter_pivot_mode(settings_node: str) -> Tuple[bool, str]:
 
     nodes = get_rig_nodes(settings_node)
     pivot_grp = nodes["pivot_grp"]
+    align_grp = nodes["align_grp"]
 
     if not pivot_grp or not cmds.objExists(pivot_grp):
         return False, "Pivot group not found."
@@ -284,6 +284,10 @@ def enter_pivot_mode(settings_node: str) -> Tuple[bool, str]:
 
     # Update visual feedback - orange color for pivot mode
     _update_pivot_visual(pivot_grp, "pivot_mode")
+
+    # Make sure align_grp is visible during pivot editing
+    if align_grp and cmds.objExists(align_grp):
+        cmds.setAttr(f"{align_grp}.visibility", 1)
 
     return True, "Pivot mode active. Move the pivot, then switch to Translate/Rotate to apply."
 
@@ -333,9 +337,6 @@ def exit_pivot_mode(settings_node: str) -> Tuple[bool, str]:
     cmds.setAttr(f"{settings_node}.constraintName", constraint, type="string")
     cmds.setAttr(f"{settings_node}.isActive", True)
 
-    # Show visibility
-    cmds.setAttr(f"{pivot_grp}.visibility", 1)
-
     # Update visual feedback - green for active
     _update_pivot_visual(pivot_grp, "on_state")
 
@@ -345,7 +346,7 @@ def exit_pivot_mode(settings_node: str) -> Tuple[bool, str]:
     # Select the pivot group so user can manipulate
     cmds.select(pivot_grp)
 
-    return True, f"Pivot mode exited. Constraint created. Manipulate '{pivot_grp}' to move '{control}'."
+    return True, f"Pivot mode exited. Constraint created. Manipulate pivot to move '{control}'."
 
 
 def _setup_pivot_mode_monitor(settings_node: str) -> None:
@@ -411,10 +412,14 @@ def create_temp_pivot(control: str) -> Tuple[bool, str, Optional[str]]:
     """
     Create a temp pivot at the selected control.
 
-    Process:
-    1. Create a null group at the control's world position/rotation
-    2. Enter pivot mode so user can position the pivot
-    3. When user switches to translate/rotate, constraint is created
+    Creates two groups:
+    - align_grp: Parent group that realigns to control on toggle
+    - pivot_grp: Child group where user adjusts pivot, constrains control
+
+    Hierarchy:
+        align_grp (realigns to control)
+          └── pivot_grp (user moves pivot here)
+                └── settings node
 
     Args:
         control: The control to create a temp pivot for
@@ -442,12 +447,19 @@ def create_temp_pivot(control: str) -> Tuple[bool, str, Optional[str]]:
     prefix = _sanitize_name(control)
 
     # =========================================================================
-    # Create the temp pivot group
+    # Create align_grp (parent - this realigns to control on toggle)
+    # =========================================================================
+    align_grp = cmds.group(empty=True, name=f"{prefix}{ALIGN_GRP_SUFFIX}")
+    _match_transform_world(align_grp, control)
+
+    # =========================================================================
+    # Create pivot_grp (child - user adjusts pivot here)
     # =========================================================================
     pivot_grp = cmds.group(empty=True, name=f"{prefix}{PIVOT_GRP_SUFFIX}")
-
-    # Match to control's world transform
     _match_transform_world(pivot_grp, control)
+
+    # Parent pivot_grp under align_grp
+    cmds.parent(pivot_grp, align_grp)
 
     # Add a locator shape for visibility
     loc = cmds.spaceLocator()[0]
@@ -499,6 +511,7 @@ def create_temp_pivot(control: str) -> Tuple[bool, str, Optional[str]]:
 
     # Store references
     _add_string_attr(settings_node, "targetControl", control)
+    _add_string_attr(settings_node, "alignGrp", align_grp)
     _add_string_attr(settings_node, "pivotGrp", pivot_grp)
     _add_string_attr(settings_node, "constraintName", "")
     _add_bool_attr(settings_node, "isActive", False)
@@ -524,20 +537,15 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     Reactivate the temp pivot system.
 
     Process:
-    1. Store the current pivot offset in LOCAL space (relative to group origin)
-    2. Realign the pivot group to the control's current world position/rotation
-    3. Restore the pivot offset in local space
-    4. Create parentConstraint: pivot_grp → control
+    1. Realign align_grp to the control's current world position/rotation
+    2. pivot_grp (child of align_grp) moves with it, preserving its pivot offset
+    3. Create parentConstraint: pivot_grp → control
 
-    The pivot maintains its RELATIVE position to the control:
-    - If pivot was 2 units to the right of control, it stays 2 units to the right
-    - If control rotates, the pivot rotates with it (stays in control's local space)
-
-    Example:
-    - Control at (0,0,0), pivot at local offset (2,0,0) = world (2,0,0)
-    - Control moves to (5,0,0) and rotates 90° Y
-    - After toggle_on: group at (5,0,0) rot 90°Y, pivot local (2,0,0) = world (5,0,-2)
-    - The pivot is still 2 units away in the control's local X direction
+    The two-group hierarchy naturally preserves the pivot:
+    - align_grp realigns to control
+    - pivot_grp follows as a child (local transform preserved)
+    - pivot_grp's rotatePivot offset is unchanged
+    - Result: pivot stays at same relative position to control
 
     Args:
         settings_node: The settings node for this rig
@@ -553,30 +561,21 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
 
     nodes = get_rig_nodes(settings_node)
     control = nodes["control"]
+    align_grp = nodes["align_grp"]
     pivot_grp = nodes["pivot_grp"]
 
     if not control or not cmds.objExists(control):
         return False, f"Control '{control}' not found."
+    if not align_grp or not cmds.objExists(align_grp):
+        return False, "Align group not found."
     if not pivot_grp or not cmds.objExists(pivot_grp):
         return False, "Pivot group not found."
 
     # =========================================================================
-    # Get the current pivot offset (local space rotatePivot)
-    # This is the pivot location relative to the group's origin
+    # Realign align_grp to the control's world position/rotation
+    # pivot_grp (as a child) will follow, keeping its local transform & pivot
     # =========================================================================
-    pivot_local = cmds.xform(pivot_grp, q=True, os=True, rp=True)
-
-    # =========================================================================
-    # Realign the pivot group to the control's world position
-    # =========================================================================
-    _match_transform_world(pivot_grp, control)
-
-    # =========================================================================
-    # Restore the pivot offset
-    # The pivot stays in the same relative position to the group
-    # =========================================================================
-    cmds.xform(pivot_grp, os=True, rp=pivot_local)
-    cmds.xform(pivot_grp, os=True, sp=pivot_local)
+    _match_transform_world(align_grp, control)
 
     # =========================================================================
     # Create parentConstraint: pivot_grp → control
@@ -600,7 +599,7 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     # =========================================================================
     # Show visibility
     # =========================================================================
-    cmds.setAttr(f"{pivot_grp}.visibility", 1)
+    cmds.setAttr(f"{align_grp}.visibility", 1)
 
     # Update visual - green for active
     _update_pivot_visual(pivot_grp, "on_state")
@@ -611,7 +610,7 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     # Select pivot group
     cmds.select(pivot_grp)
 
-    return True, f"Pivot ON. Manipulate '{pivot_grp}' to move '{control}'."
+    return True, f"Pivot ON. Manipulate pivot to move '{control}'."
 
 
 # =============================================================================
@@ -625,7 +624,7 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     Process:
     1. Key the control at current position
     2. Delete the constraint
-    3. Hide the pivot group
+    3. Hide the align group (and children)
 
     Args:
         settings_node: The settings node for this rig
@@ -642,6 +641,7 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     nodes = get_rig_nodes(settings_node)
     control = nodes["control"]
     constraint = nodes["constraint"]
+    align_grp = nodes["align_grp"]
     pivot_grp = nodes["pivot_grp"]
 
     # =========================================================================
@@ -675,8 +675,8 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     # =========================================================================
     # Hide visibility
     # =========================================================================
-    if pivot_grp and cmds.objExists(pivot_grp):
-        cmds.setAttr(f"{pivot_grp}.visibility", 0)
+    if align_grp and cmds.objExists(align_grp):
+        cmds.setAttr(f"{align_grp}.visibility", 0)
 
     # Update visual - orange for inactive
     if pivot_grp and cmds.objExists(pivot_grp):
@@ -847,12 +847,16 @@ def delete_pivot_rig(settings_node: str) -> Tuple[bool, str]:
     if is_rig_active(settings_node):
         toggle_off(settings_node)
 
-    # Delete pivot group (deletes settings node too since it's parented)
+    # Delete align_grp (deletes pivot_grp and settings node too since they're children)
+    align_grp = nodes["align_grp"]
+    if align_grp and cmds.objExists(align_grp):
+        cmds.delete(align_grp)
+
+    # Clean up any orphaned nodes
     pivot_grp = nodes["pivot_grp"]
     if pivot_grp and cmds.objExists(pivot_grp):
         cmds.delete(pivot_grp)
 
-    # Clean up any remaining settings node
     if cmds.objExists(settings_node):
         cmds.delete(settings_node)
 
@@ -1200,6 +1204,13 @@ def show() -> None:
                 if cmds.objExists(possible_settings):
                     selected_settings = possible_settings
                 break
+            # Check for align group
+            if ALIGN_GRP_SUFFIX in item:
+                prefix = item.replace(ALIGN_GRP_SUFFIX, "")
+                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
+                if cmds.objExists(possible_settings):
+                    selected_settings = possible_settings
+                break
             # Check if it's a control with a rig
             rig = get_rig_for_control(item)
             if rig:
@@ -1231,6 +1242,11 @@ def show() -> None:
         for item in sel:
             if PIVOT_GRP_SUFFIX in item:
                 prefix = item.replace(PIVOT_GRP_SUFFIX, "")
+                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
+                if cmds.objExists(possible_settings):
+                    return ("rig", possible_settings)
+            if ALIGN_GRP_SUFFIX in item:
+                prefix = item.replace(ALIGN_GRP_SUFFIX, "")
                 possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
                 if cmds.objExists(possible_settings):
                     return ("rig", possible_settings)
