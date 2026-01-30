@@ -186,50 +186,66 @@ def _has_constraints(node: str) -> Tuple[bool, List[str]]:
     return len(found_constraints) > 0, found_constraints
 
 
-def _check_constrainable_attrs(node: str) -> Dict[str, bool]:
+def _check_constrainable_attrs(node: str) -> Dict[str, Any]:
     """
     Check which transform attributes can be constrained on a node.
 
-    Returns a dict with keys 'translate' and 'rotate', each True if those
-    attributes can be driven by a constraint.
+    Returns a dict with:
+    - 'translate': True if ALL translate attrs can be constrained
+    - 'rotate': True if ALL rotate attrs can be constrained
+    - 'skip_translate': list of axes to skip (e.g., ['x', 'z'])
+    - 'skip_rotate': list of axes to skip
     """
-    result = {"translate": True, "rotate": True}
+    result = {
+        "translate": True,
+        "rotate": True,
+        "skip_translate": [],
+        "skip_rotate": []
+    }
 
-    # Check translate attributes
-    for attr in ["tx", "ty", "tz"]:
+    # Check translate attributes individually
+    for axis, attr in [("x", "tx"), ("y", "ty"), ("z", "tz")]:
         attr_path = f"{node}.{attr}"
         if cmds.objExists(attr_path):
+            can_constrain = True
             # Check if locked
             if cmds.getAttr(attr_path, lock=True):
-                result["translate"] = False
-                break
-            # Check if has incoming connections (not from constraints we'll create)
-            connections = cmds.listConnections(attr_path, source=True, destination=False) or []
-            for conn in connections:
-                node_type = cmds.nodeType(conn)
-                # Skip if it's our own constraint
-                if TOOL_PREFIX in conn:
-                    continue
-                # Has other incoming connection - can't constrain
-                result["translate"] = False
-                break
+                can_constrain = False
+            else:
+                # Check if has incoming connections (not from constraints we'll create)
+                connections = cmds.listConnections(attr_path, source=True, destination=False) or []
+                for conn in connections:
+                    # Skip if it's our own constraint
+                    if TOOL_PREFIX in conn:
+                        continue
+                    # Has other incoming connection - can't constrain
+                    can_constrain = False
+                    break
 
-    # Check rotate attributes
-    for attr in ["rx", "ry", "rz"]:
+            if not can_constrain:
+                result["skip_translate"].append(axis)
+                result["translate"] = False
+
+    # Check rotate attributes individually
+    for axis, attr in [("x", "rx"), ("y", "ry"), ("z", "rz")]:
         attr_path = f"{node}.{attr}"
         if cmds.objExists(attr_path):
+            can_constrain = True
             # Check if locked
             if cmds.getAttr(attr_path, lock=True):
+                can_constrain = False
+            else:
+                # Check if has incoming connections
+                connections = cmds.listConnections(attr_path, source=True, destination=False) or []
+                for conn in connections:
+                    if TOOL_PREFIX in conn:
+                        continue
+                    can_constrain = False
+                    break
+
+            if not can_constrain:
+                result["skip_rotate"].append(axis)
                 result["rotate"] = False
-                break
-            # Check if has incoming connections
-            connections = cmds.listConnections(attr_path, source=True, destination=False) or []
-            for conn in connections:
-                node_type = cmds.nodeType(conn)
-                if TOOL_PREFIX in conn:
-                    continue
-                result["rotate"] = False
-                break
 
     return result
 
@@ -568,6 +584,16 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     prefix = _sanitize_name(control)
 
     # =========================================================================
+    # Check which attributes can be constrained on the control
+    # =========================================================================
+    constrainable = _check_constrainable_attrs(control)
+    warnings = []
+    if constrainable["skip_translate"]:
+        warnings.append(f"translate {constrainable['skip_translate']} (locked/connected)")
+    if constrainable["skip_rotate"]:
+        warnings.append(f"rotate {constrainable['skip_rotate']} (locked/connected)")
+
+    # =========================================================================
     # Create null_group_2 (anchor) - aligned to control's current position
     # This is created now instead of on first toggle OFF for consistent behavior
     # =========================================================================
@@ -597,14 +623,18 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
 
     # =========================================================================
     # Create parentConstraint: null_group_1 → control (maintainOffset=ON)
+    # Use skip flags if some attributes can't be constrained
     # =========================================================================
     constraint_name = f"{prefix}{CONSTRAINT_SUFFIX}"
     if cmds.objExists(constraint_name):
         cmds.delete(constraint_name)
 
+    # Build constraint with appropriate skip flags for individual axes
     constraint = cmds.parentConstraint(
         null_grp_1, control,
         maintainOffset=True,
+        skipTranslate=constrainable["skip_translate"],
+        skipRotate=constrainable["skip_rotate"],
         name=constraint_name
     )[0]
 
@@ -637,7 +667,12 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     # Use evalDeferred to ensure proper timing after constraint creation
     cmds.evalDeferred(lambda: _exit_pivot_adjust_mode(null_grp_1))
 
-    return True, f"Setup complete! Rotate/translate pivot null to control '{control}'. Auto-key enabled.", settings_node
+    # Build result message with any warnings
+    result_msg = f"Setup complete! Rotate/translate pivot null to control '{control}'. Auto-key enabled."
+    if warnings:
+        result_msg += f" WARNING: Skipped {', '.join(warnings)}."
+
+    return True, result_msg, settings_node
 
 
 # =============================================================================
@@ -697,6 +732,11 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     cmds.setAttr(f"{null_grp_1}.rz", 0)
 
     # =========================================================================
+    # Check which attributes can be constrained
+    # =========================================================================
+    constrainable = _check_constrainable_attrs(control)
+
+    # =========================================================================
     # Recreate parentConstraint: null_group_1 → control
     # =========================================================================
     prefix = _sanitize_name(control)
@@ -708,6 +748,8 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     constraint = cmds.parentConstraint(
         null_grp_1, control,
         maintainOffset=True,
+        skipTranslate=constrainable["skip_translate"],
+        skipRotate=constrainable["skip_rotate"],
         name=constraint_name
     )[0]
 
@@ -729,7 +771,7 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     # Select null_grp_1
     cmds.select(null_grp_1)
 
-    return True, f"Pivot ON. Rotate pivot null to orbit '{control}'. Auto-key enabled."
+    return True, f"Pivot ON. Rotate/translate pivot null to control '{control}'. Auto-key enabled."
 
 
 # =============================================================================
