@@ -14,7 +14,7 @@ Hierarchy when ACTIVE (constraint ON):
 
 Workflow:
 1. Select control, click "Create Pivot Locator" (Stage 1)
-2. Use Maya's "Adjust Pivot" tool (D key or Insert) to position the pivot
+2. Tool automatically enters pivot adjust mode - move the pivot to desired position
 3. Click "Complete Setup" (Stage 2) - creates constraint to control
 4. Rotate null_group_1 - control orbits around the custom pivot point (auto-keys applied)
 5. Toggle OFF - creates null_group_2 as anchor, constraint deleted, control free to move
@@ -37,6 +37,7 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import maya.cmds as cmds
+import maya.mel as mel
 
 # -----------------------------
 # Constants
@@ -72,9 +73,9 @@ TOOLTIPS = {
     "create_pivot_btn": (
         "STAGE 1: Create the pivot null (null_group_1).\n\n"
         "1. Creates null_group_1 aligned to the control\n"
-        "2. Use Maya's 'Adjust Pivot' tool (D key or Insert)\n"
-        "   to move the pivot to your desired position\n"
-        "3. Then click 'Complete Setup' to finish"
+        "2. Automatically enters pivot adjust mode with Move tool\n"
+        "3. Move the pivot to your desired position\n"
+        "4. Then click 'Complete Setup' to finish"
     ),
     "complete_setup_btn": (
         "STAGE 2: Complete the pivot rig setup.\n\n"
@@ -185,6 +186,70 @@ def _has_constraints(node: str) -> Tuple[bool, List[str]]:
     return len(found_constraints) > 0, found_constraints
 
 
+def _check_constrainable_attrs(node: str) -> Dict[str, Any]:
+    """
+    Check which transform attributes can be constrained on a node.
+
+    Returns a dict with:
+    - 'translate': True if ALL translate attrs can be constrained
+    - 'rotate': True if ALL rotate attrs can be constrained
+    - 'skip_translate': list of axes to skip (e.g., ['x', 'z'])
+    - 'skip_rotate': list of axes to skip
+    """
+    result = {
+        "translate": True,
+        "rotate": True,
+        "skip_translate": [],
+        "skip_rotate": []
+    }
+
+    # Check translate attributes individually
+    for axis, attr in [("x", "tx"), ("y", "ty"), ("z", "tz")]:
+        attr_path = f"{node}.{attr}"
+        if cmds.objExists(attr_path):
+            can_constrain = True
+            # Check if locked
+            if cmds.getAttr(attr_path, lock=True):
+                can_constrain = False
+            else:
+                # Check if has incoming connections (not from constraints we'll create)
+                connections = cmds.listConnections(attr_path, source=True, destination=False) or []
+                for conn in connections:
+                    # Skip if it's our own constraint
+                    if TOOL_PREFIX in conn:
+                        continue
+                    # Has other incoming connection - can't constrain
+                    can_constrain = False
+                    break
+
+            if not can_constrain:
+                result["skip_translate"].append(axis)
+                result["translate"] = False
+
+    # Check rotate attributes individually
+    for axis, attr in [("x", "rx"), ("y", "ry"), ("z", "rz")]:
+        attr_path = f"{node}.{attr}"
+        if cmds.objExists(attr_path):
+            can_constrain = True
+            # Check if locked
+            if cmds.getAttr(attr_path, lock=True):
+                can_constrain = False
+            else:
+                # Check if has incoming connections
+                connections = cmds.listConnections(attr_path, source=True, destination=False) or []
+                for conn in connections:
+                    if TOOL_PREFIX in conn:
+                        continue
+                    can_constrain = False
+                    break
+
+            if not can_constrain:
+                result["skip_rotate"].append(axis)
+                result["rotate"] = False
+
+    return result
+
+
 def _add_string_attr(node: str, attr: str, value: str = "") -> None:
     """Add a string attribute if it doesn't exist."""
     if not cmds.attributeQuery(attr, node=node, exists=True):
@@ -211,8 +276,25 @@ def _create_visual_null(name: str, color: Tuple[float, float, float], size: floa
     Returns:
         The name of the created null group
     """
+    # Clean up any existing nodes with conflicting names first
+    # This prevents Maya auto-renaming and creating orphaned nodes
+    nodes_to_clean = [
+        name,
+        f"{name}_ringX", f"{name}_ringY", f"{name}_ringZ",
+        f"{name}_loc"
+    ]
+    for node_name in nodes_to_clean:
+        if cmds.objExists(node_name):
+            try:
+                cmds.delete(node_name)
+            except Exception:
+                pass
+
     # Create the null group
     null_grp = cmds.group(empty=True, name=name)
+
+    # Track transforms to delete after all shapes are parented
+    transforms_to_delete = []
 
     # Add visual circles for each axis
     for axis, axis_color, normal in [
@@ -220,36 +302,60 @@ def _create_visual_null(name: str, color: Tuple[float, float, float], size: floa
         ("Y", (0.3, 1, 0.3), (0, 1, 0)),
         ("Z", (0.3, 0.5, 1), (0, 0, 1))
     ]:
+        temp_name = f"{name}_ring{axis}"
         circle = cmds.circle(
-            name=f"{name}_ring{axis}",
+            name=temp_name,
             normal=normal,
             radius=0.5 * size,
             degree=3,
             sections=24,
             constructionHistory=False
         )[0]
-        circle_shape = cmds.listRelatives(circle, shapes=True)[0]
-        cmds.setAttr(f"{circle_shape}.overrideEnabled", 1)
-        cmds.setAttr(f"{circle_shape}.overrideRGBColors", 1)
-        cmds.setAttr(f"{circle_shape}.overrideColorR", axis_color[0])
-        cmds.setAttr(f"{circle_shape}.overrideColorG", axis_color[1])
-        cmds.setAttr(f"{circle_shape}.overrideColorB", axis_color[2])
-        cmds.parent(circle_shape, null_grp, shape=True, relative=True)
-        cmds.delete(circle)
+
+        # Get the shape from the actual created node (in case Maya renamed it)
+        shapes = cmds.listRelatives(circle, shapes=True) or []
+        if shapes:
+            circle_shape = shapes[0]
+            cmds.setAttr(f"{circle_shape}.overrideEnabled", 1)
+            cmds.setAttr(f"{circle_shape}.overrideRGBColors", 1)
+            cmds.setAttr(f"{circle_shape}.overrideColorR", axis_color[0])
+            cmds.setAttr(f"{circle_shape}.overrideColorG", axis_color[1])
+            cmds.setAttr(f"{circle_shape}.overrideColorB", axis_color[2])
+            cmds.parent(circle_shape, null_grp, shape=True, relative=True)
+
+        # Track for deletion (use the actual created name from Maya)
+        transforms_to_delete.append(circle)
 
     # Add a center locator shape for selection clarity
-    loc = cmds.spaceLocator(name=f"{name}_loc")[0]
-    loc_shape = cmds.listRelatives(loc, shapes=True)[0]
-    cmds.setAttr(f"{loc_shape}.overrideEnabled", 1)
-    cmds.setAttr(f"{loc_shape}.overrideRGBColors", 1)
-    cmds.setAttr(f"{loc_shape}.overrideColorR", color[0])
-    cmds.setAttr(f"{loc_shape}.overrideColorG", color[1])
-    cmds.setAttr(f"{loc_shape}.overrideColorB", color[2])
-    cmds.setAttr(f"{loc_shape}.localScaleX", 0.3 * size)
-    cmds.setAttr(f"{loc_shape}.localScaleY", 0.3 * size)
-    cmds.setAttr(f"{loc_shape}.localScaleZ", 0.3 * size)
-    cmds.parent(loc_shape, null_grp, shape=True, relative=True)
-    cmds.delete(loc)
+    loc_temp_name = f"{name}_loc"
+    loc = cmds.spaceLocator(name=loc_temp_name)[0]
+    loc_shapes = cmds.listRelatives(loc, shapes=True) or []
+    if loc_shapes:
+        loc_shape = loc_shapes[0]
+        cmds.setAttr(f"{loc_shape}.overrideEnabled", 1)
+        cmds.setAttr(f"{loc_shape}.overrideRGBColors", 1)
+        cmds.setAttr(f"{loc_shape}.overrideColorR", color[0])
+        cmds.setAttr(f"{loc_shape}.overrideColorG", color[1])
+        cmds.setAttr(f"{loc_shape}.overrideColorB", color[2])
+        cmds.setAttr(f"{loc_shape}.localScaleX", 0.3 * size)
+        cmds.setAttr(f"{loc_shape}.localScaleY", 0.3 * size)
+        cmds.setAttr(f"{loc_shape}.localScaleZ", 0.3 * size)
+        cmds.parent(loc_shape, null_grp, shape=True, relative=True)
+
+    transforms_to_delete.append(loc)
+
+    # Delete all the empty transform nodes after shape parenting is complete
+    # This ensures Maya has finished all shape parenting operations
+    for transform in transforms_to_delete:
+        if cmds.objExists(transform):
+            # Check if the transform still has shapes (parenting failed)
+            remaining_shapes = cmds.listRelatives(transform, shapes=True) or []
+            if remaining_shapes:
+                # Shape parenting failed - delete the whole thing
+                cmds.delete(transform)
+            else:
+                # Shape parenting succeeded - delete the empty transform
+                cmds.delete(transform)
 
     return null_grp
 
@@ -262,6 +368,40 @@ def _set_null_color(null_grp: str, color: Tuple[float, float, float]) -> None:
             cmds.setAttr(f"{shape}.overrideColorR", color[0])
             cmds.setAttr(f"{shape}.overrideColorG", color[1])
             cmds.setAttr(f"{shape}.overrideColorB", color[2])
+
+
+def _enter_pivot_adjust_mode(node: str) -> None:
+    """
+    Enter custom pivot editing mode with the translate tool active on the given node.
+
+    This selects the node, activates the Move tool, and enters custom pivot editing
+    mode (equivalent to pressing D or Insert key) so the user can immediately
+    adjust the pivot position.
+
+    See: https://help.autodesk.com/view/MAYAUL/2026/ENU/?guid=GUID-6BCE41D8-07CB-4A99-99CD-1D3986896157
+    """
+    # Ensure the node is selected
+    cmds.select(node, replace=True)
+
+    # Activate the Move tool and enter custom pivot editing mode
+    # ctxEditMode is the MEL command equivalent to pressing D or Insert key
+    mel.eval('MoveTool; ctxEditMode;')
+
+
+def _exit_pivot_adjust_mode(node: str) -> None:
+    """
+    Exit custom pivot editing mode and switch to rotate tool.
+
+    This ensures the user is no longer in pivot editing mode and can
+    manipulate the object normally with the rotate tool.
+    """
+    # Ensure the node is selected
+    cmds.select(node, replace=True)
+
+    # Exit pivot editing mode by calling ctxEditMode again (it toggles)
+    # Then switch to rotate tool for normal manipulation
+    # First, make sure we're not in edit mode by switching to a fresh tool
+    mel.eval('RotateTool;')
 
 
 # -----------------------------
@@ -345,8 +485,9 @@ def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
     Process:
     1. Create null_group_1
     2. Align to the selected control using world matrix
-    3. User will use Maya's "Adjust Pivot" tool to set the pivot position
-    4. Then user clicks "Complete Setup" for Stage 2
+    3. Automatically enter pivot adjust mode with Move tool active
+    4. User moves the pivot to desired position
+    5. Then user clicks "Complete Setup" for Stage 2
 
     Args:
         control: The control to create a pivot for
@@ -395,10 +536,11 @@ def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
     _add_string_attr(null_grp_1, "targetControl", control)
     _add_bool_attr(null_grp_1, "setupComplete", False)
 
-    # Select the null so user can adjust its pivot
-    cmds.select(null_grp_1)
+    # Select the null and enter pivot adjust mode with translate tool
+    # Use evalDeferred to ensure proper initialization timing
+    cmds.evalDeferred(lambda: _enter_pivot_adjust_mode(null_grp_1))
 
-    return True, f"Stage 1 complete. Use 'Adjust Pivot' tool (D key) to set pivot position, then click 'Complete Setup'.", null_grp_1
+    return True, f"Stage 1 complete. Move the PIVOT to your desired position, then click 'Complete Setup'.", null_grp_1
 
 
 # =============================================================================
@@ -411,10 +553,11 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
 
     Process:
     1. Get the target control from null_group_1
-    2. Create parentConstraint: null_group_1 → control (maintainOffset)
-    3. Create settings node
-
-    Note: null_group_2 is NOT created here - it's created on first toggle OFF.
+    2. Create null_group_2 (anchor) aligned to control
+    3. Parent null_group_1 under null_group_2
+    4. Zero null_group_1's local transforms (pivot offset preserved in rotatePivot)
+    5. Create parentConstraint: null_group_1 → control (maintainOffset)
+    6. Create settings node
 
     Args:
         null_grp_1: The pivot null from Stage 1
@@ -441,15 +584,57 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     prefix = _sanitize_name(control)
 
     # =========================================================================
+    # Check which attributes can be constrained on the control
+    # =========================================================================
+    constrainable = _check_constrainable_attrs(control)
+    warnings = []
+    if constrainable["skip_translate"]:
+        warnings.append(f"translate {constrainable['skip_translate']} (locked/connected)")
+    if constrainable["skip_rotate"]:
+        warnings.append(f"rotate {constrainable['skip_rotate']} (locked/connected)")
+
+    # =========================================================================
+    # Create null_group_2 (anchor) - aligned to control's current position
+    # This is created now instead of on first toggle OFF for consistent behavior
+    # =========================================================================
+    null_grp_2 = _create_visual_null(
+        f"{prefix}{NULL_GRP_2_SUFFIX}",
+        UI_COLORS["stage2"],  # Blue for anchor
+        size=1.2
+    )
+    _align_to_target_world_matrix(null_grp_2, control)
+
+    # =========================================================================
+    # Parent null_group_1 under null_group_2
+    # =========================================================================
+    cmds.parent(null_grp_1, null_grp_2)
+
+    # =========================================================================
+    # Reset null_group_1's LOCAL transforms to zero
+    # The pivot offset is preserved in rotatePivot/scalePivot attributes
+    # This ensures translation works correctly with the constraint
+    # =========================================================================
+    cmds.setAttr(f"{null_grp_1}.tx", 0)
+    cmds.setAttr(f"{null_grp_1}.ty", 0)
+    cmds.setAttr(f"{null_grp_1}.tz", 0)
+    cmds.setAttr(f"{null_grp_1}.rx", 0)
+    cmds.setAttr(f"{null_grp_1}.ry", 0)
+    cmds.setAttr(f"{null_grp_1}.rz", 0)
+
+    # =========================================================================
     # Create parentConstraint: null_group_1 → control (maintainOffset=ON)
+    # Use skip flags if some attributes can't be constrained
     # =========================================================================
     constraint_name = f"{prefix}{CONSTRAINT_SUFFIX}"
     if cmds.objExists(constraint_name):
         cmds.delete(constraint_name)
 
+    # Build constraint with appropriate skip flags for individual axes
     constraint = cmds.parentConstraint(
         null_grp_1, control,
         maintainOffset=True,
+        skipTranslate=constrainable["skip_translate"],
+        skipRotate=constrainable["skip_rotate"],
         name=constraint_name
     )[0]
 
@@ -462,7 +647,7 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     # Store references
     _add_string_attr(settings_node, "targetControl", control)
     _add_string_attr(settings_node, "nullGrp1", null_grp_1)
-    _add_string_attr(settings_node, "nullGrp2", "")  # Created on first toggle OFF
+    _add_string_attr(settings_node, "nullGrp2", null_grp_2)
     _add_string_attr(settings_node, "constraintName", constraint)
     _add_bool_attr(settings_node, "isActive", True)
 
@@ -478,10 +663,16 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     # Set up auto-key for transform changes
     setup_auto_key(settings_node)
 
-    # Select null_grp_1 so user can start using it
-    cmds.select(null_grp_1)
+    # Exit pivot adjust mode and switch to rotate tool
+    # Use evalDeferred to ensure proper timing after constraint creation
+    cmds.evalDeferred(lambda: _exit_pivot_adjust_mode(null_grp_1))
 
-    return True, f"Setup complete! Rotate pivot null to orbit '{control}' around custom pivot. Auto-key enabled.", settings_node
+    # Build result message with any warnings
+    result_msg = f"Setup complete! Rotate/translate pivot null to control '{control}'. Auto-key enabled."
+    if warnings:
+        result_msg += f" WARNING: Skipped {', '.join(warnings)}."
+
+    return True, result_msg, settings_node
 
 
 # =============================================================================
@@ -541,6 +732,11 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     cmds.setAttr(f"{null_grp_1}.rz", 0)
 
     # =========================================================================
+    # Check which attributes can be constrained
+    # =========================================================================
+    constrainable = _check_constrainable_attrs(control)
+
+    # =========================================================================
     # Recreate parentConstraint: null_group_1 → control
     # =========================================================================
     prefix = _sanitize_name(control)
@@ -552,6 +748,8 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     constraint = cmds.parentConstraint(
         null_grp_1, control,
         maintainOffset=True,
+        skipTranslate=constrainable["skip_translate"],
+        skipRotate=constrainable["skip_rotate"],
         name=constraint_name
     )[0]
 
@@ -573,7 +771,7 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     # Select null_grp_1
     cmds.select(null_grp_1)
 
-    return True, f"Pivot ON. Rotate pivot null to orbit '{control}'. Auto-key enabled."
+    return True, f"Pivot ON. Rotate/translate pivot null to control '{control}'. Auto-key enabled."
 
 
 # =============================================================================
@@ -633,13 +831,24 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
             cmds.delete(c)
 
     prefix = _sanitize_name(control)
+    expected_anchor_name = f"{prefix}{NULL_GRP_2_SUFFIX}"
 
     # =========================================================================
     # Create null_group_2 if it doesn't exist (first toggle OFF)
     # =========================================================================
-    if not null_grp_2 or not cmds.objExists(null_grp_2):
+    # Check if we have a valid reference, or if the expected anchor already exists
+    anchor_exists = False
+    if null_grp_2 and cmds.objExists(null_grp_2):
+        anchor_exists = True
+    elif cmds.objExists(expected_anchor_name):
+        # The anchor exists but settings might have outdated reference
+        null_grp_2 = expected_anchor_name
+        cmds.setAttr(f"{settings_node}.nullGrp2", null_grp_2, type="string")
+        anchor_exists = True
+
+    if not anchor_exists:
         null_grp_2 = _create_visual_null(
-            f"{prefix}{NULL_GRP_2_SUFFIX}",
+            expected_anchor_name,
             UI_COLORS["stage2"],  # Blue for anchor
             size=1.2  # Slightly larger to distinguish
         )
@@ -909,7 +1118,7 @@ def show() -> None:
 
     cmds.text(
         label="1. Select control, click 'Create Pivot Locator'\n"
-              "2. Use 'Adjust Pivot' (D key) to set pivot point\n"
+              "2. Move the pivot to your desired position\n"
               "3. Click 'Complete Setup'\n"
               "4. Rotate pivot null, Key, Toggle OFF when done",
         align="left",
@@ -971,7 +1180,7 @@ def show() -> None:
 
     cmds.text(
         label="Select a control, then create the pivot null.\n"
-              "Use 'Adjust Pivot' tool to set pivot position:",
+              "Move the pivot to your desired position:",
         align="left",
         font="smallPlainLabelFont",
         height=32
@@ -1292,6 +1501,9 @@ def show() -> None:
     # Button callbacks
 
     def on_create_pivot(*args):
+        # Force Maya to process any pending events and refresh selection
+        cmds.refresh(force=True)
+
         sel = cmds.ls(selection=True, type="transform") or []
         controls = [s for s in sel if TOOL_PREFIX not in s]
 
@@ -1302,8 +1514,10 @@ def show() -> None:
         control = controls[0]
         success, msg, pivot = create_pivot_locator(control)
         log_message(msg, "success" if success else "warning")
-        refresh_rig_list()
-        update_status()
+
+        # Defer UI updates to avoid interfering with pivot adjust mode activation
+        cmds.evalDeferred(refresh_rig_list)
+        cmds.evalDeferred(update_status)
 
     def on_complete_setup(*args):
         ctx_type, ctx_node = get_current_context()
