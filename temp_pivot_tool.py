@@ -214,6 +214,7 @@ def _create_visual_null(name: str, color: Tuple[float, float, float], size: floa
     """
     # Create the null group
     null_grp = cmds.group(empty=True, name=name)
+    base_name = null_grp
 
     # Add visual circles for each axis
     for axis, axis_color, normal in [
@@ -222,7 +223,7 @@ def _create_visual_null(name: str, color: Tuple[float, float, float], size: floa
         ("Z", (0.3, 0.5, 1), (0, 0, 1))
     ]:
         circle = cmds.circle(
-            name=f"{name}_ring{axis}",
+            name=f"{base_name}_ring{axis}",
             normal=normal,
             radius=0.5 * size,
             degree=3,
@@ -239,7 +240,7 @@ def _create_visual_null(name: str, color: Tuple[float, float, float], size: floa
         cmds.delete(circle)
 
     # Add a center locator shape for selection clarity
-    loc = cmds.spaceLocator(name=f"{name}_loc")[0]
+    loc = cmds.spaceLocator(name=f"{base_name}_loc")[0]
     loc_shape = cmds.listRelatives(loc, shapes=True)[0]
     cmds.setAttr(f"{loc_shape}.overrideEnabled", 1)
     cmds.setAttr(f"{loc_shape}.overrideRGBColors", 1)
@@ -251,6 +252,13 @@ def _create_visual_null(name: str, color: Tuple[float, float, float], size: floa
     cmds.setAttr(f"{loc_shape}.localScaleZ", 0.3 * size)
     cmds.parent(loc_shape, null_grp, shape=True, relative=True)
     cmds.delete(loc)
+
+    # Defensive cleanup: remove any leftover ring/locator transforms that failed to parent.
+    for pattern in (f"{base_name}_ring*", f"{base_name}_loc"):
+        for node in cmds.ls(pattern, type="transform") or []:
+            parent = cmds.listRelatives(node, parent=True) or []
+            if not parent or parent[0] != null_grp:
+                cmds.delete(node)
 
     return null_grp
 
