@@ -186,6 +186,54 @@ def _has_constraints(node: str) -> Tuple[bool, List[str]]:
     return len(found_constraints) > 0, found_constraints
 
 
+def _check_constrainable_attrs(node: str) -> Dict[str, bool]:
+    """
+    Check which transform attributes can be constrained on a node.
+
+    Returns a dict with keys 'translate' and 'rotate', each True if those
+    attributes can be driven by a constraint.
+    """
+    result = {"translate": True, "rotate": True}
+
+    # Check translate attributes
+    for attr in ["tx", "ty", "tz"]:
+        attr_path = f"{node}.{attr}"
+        if cmds.objExists(attr_path):
+            # Check if locked
+            if cmds.getAttr(attr_path, lock=True):
+                result["translate"] = False
+                break
+            # Check if has incoming connections (not from constraints we'll create)
+            connections = cmds.listConnections(attr_path, source=True, destination=False) or []
+            for conn in connections:
+                node_type = cmds.nodeType(conn)
+                # Skip if it's our own constraint
+                if TOOL_PREFIX in conn:
+                    continue
+                # Has other incoming connection - can't constrain
+                result["translate"] = False
+                break
+
+    # Check rotate attributes
+    for attr in ["rx", "ry", "rz"]:
+        attr_path = f"{node}.{attr}"
+        if cmds.objExists(attr_path):
+            # Check if locked
+            if cmds.getAttr(attr_path, lock=True):
+                result["rotate"] = False
+                break
+            # Check if has incoming connections
+            connections = cmds.listConnections(attr_path, source=True, destination=False) or []
+            for conn in connections:
+                node_type = cmds.nodeType(conn)
+                if TOOL_PREFIX in conn:
+                    continue
+                result["rotate"] = False
+                break
+
+    return result
+
+
 def _add_string_attr(node: str, attr: str, value: str = "") -> None:
     """Add a string attribute if it doesn't exist."""
     if not cmds.attributeQuery(attr, node=node, exists=True):
@@ -489,10 +537,11 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
 
     Process:
     1. Get the target control from null_group_1
-    2. Create parentConstraint: null_group_1 → control (maintainOffset)
-    3. Create settings node
-
-    Note: null_group_2 is NOT created here - it's created on first toggle OFF.
+    2. Create null_group_2 (anchor) aligned to control
+    3. Parent null_group_1 under null_group_2
+    4. Zero null_group_1's local transforms (pivot offset preserved in rotatePivot)
+    5. Create parentConstraint: null_group_1 → control (maintainOffset)
+    6. Create settings node
 
     Args:
         null_grp_1: The pivot null from Stage 1
@@ -519,6 +568,34 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     prefix = _sanitize_name(control)
 
     # =========================================================================
+    # Create null_group_2 (anchor) - aligned to control's current position
+    # This is created now instead of on first toggle OFF for consistent behavior
+    # =========================================================================
+    null_grp_2 = _create_visual_null(
+        f"{prefix}{NULL_GRP_2_SUFFIX}",
+        UI_COLORS["stage2"],  # Blue for anchor
+        size=1.2
+    )
+    _align_to_target_world_matrix(null_grp_2, control)
+
+    # =========================================================================
+    # Parent null_group_1 under null_group_2
+    # =========================================================================
+    cmds.parent(null_grp_1, null_grp_2)
+
+    # =========================================================================
+    # Reset null_group_1's LOCAL transforms to zero
+    # The pivot offset is preserved in rotatePivot/scalePivot attributes
+    # This ensures translation works correctly with the constraint
+    # =========================================================================
+    cmds.setAttr(f"{null_grp_1}.tx", 0)
+    cmds.setAttr(f"{null_grp_1}.ty", 0)
+    cmds.setAttr(f"{null_grp_1}.tz", 0)
+    cmds.setAttr(f"{null_grp_1}.rx", 0)
+    cmds.setAttr(f"{null_grp_1}.ry", 0)
+    cmds.setAttr(f"{null_grp_1}.rz", 0)
+
+    # =========================================================================
     # Create parentConstraint: null_group_1 → control (maintainOffset=ON)
     # =========================================================================
     constraint_name = f"{prefix}{CONSTRAINT_SUFFIX}"
@@ -540,7 +617,7 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     # Store references
     _add_string_attr(settings_node, "targetControl", control)
     _add_string_attr(settings_node, "nullGrp1", null_grp_1)
-    _add_string_attr(settings_node, "nullGrp2", "")  # Created on first toggle OFF
+    _add_string_attr(settings_node, "nullGrp2", null_grp_2)
     _add_string_attr(settings_node, "constraintName", constraint)
     _add_bool_attr(settings_node, "isActive", True)
 
@@ -560,7 +637,7 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     # Use evalDeferred to ensure proper timing after constraint creation
     cmds.evalDeferred(lambda: _exit_pivot_adjust_mode(null_grp_1))
 
-    return True, f"Setup complete! Rotate pivot null to orbit '{control}' around custom pivot. Auto-key enabled.", settings_node
+    return True, f"Setup complete! Rotate/translate pivot null to control '{control}'. Auto-key enabled.", settings_node
 
 
 # =============================================================================
