@@ -229,6 +229,9 @@ def _create_visual_null(name: str, color: Tuple[float, float, float], size: floa
     # Create the null group
     null_grp = cmds.group(empty=True, name=name)
 
+    # Track transforms to delete after all shapes are parented
+    transforms_to_delete = []
+
     # Add visual circles for each axis
     for axis, axis_color, normal in [
         ("X", (1, 0.3, 0.3), (1, 0, 0)),
@@ -256,9 +259,8 @@ def _create_visual_null(name: str, color: Tuple[float, float, float], size: floa
             cmds.setAttr(f"{circle_shape}.overrideColorB", axis_color[2])
             cmds.parent(circle_shape, null_grp, shape=True, relative=True)
 
-        # Delete the transform node (use the actual created name)
-        if cmds.objExists(circle):
-            cmds.delete(circle)
+        # Track for deletion (use the actual created name from Maya)
+        transforms_to_delete.append(circle)
 
     # Add a center locator shape for selection clarity
     loc_temp_name = f"{name}_loc"
@@ -276,9 +278,20 @@ def _create_visual_null(name: str, color: Tuple[float, float, float], size: floa
         cmds.setAttr(f"{loc_shape}.localScaleZ", 0.3 * size)
         cmds.parent(loc_shape, null_grp, shape=True, relative=True)
 
-    # Delete the locator transform (use the actual created name)
-    if cmds.objExists(loc):
-        cmds.delete(loc)
+    transforms_to_delete.append(loc)
+
+    # Delete all the empty transform nodes after shape parenting is complete
+    # This ensures Maya has finished all shape parenting operations
+    for transform in transforms_to_delete:
+        if cmds.objExists(transform):
+            # Check if the transform still has shapes (parenting failed)
+            remaining_shapes = cmds.listRelatives(transform, shapes=True) or []
+            if remaining_shapes:
+                # Shape parenting failed - delete the whole thing
+                cmds.delete(transform)
+            else:
+                # Shape parenting succeeded - delete the empty transform
+                cmds.delete(transform)
 
     return null_grp
 
@@ -309,6 +322,22 @@ def _enter_pivot_adjust_mode(node: str) -> None:
     # Activate the Move tool and enter custom pivot editing mode
     # ctxEditMode is the MEL command equivalent to pressing D or Insert key
     mel.eval('MoveTool; ctxEditMode;')
+
+
+def _exit_pivot_adjust_mode(node: str) -> None:
+    """
+    Exit custom pivot editing mode and switch to rotate tool.
+
+    This ensures the user is no longer in pivot editing mode and can
+    manipulate the object normally with the rotate tool.
+    """
+    # Ensure the node is selected
+    cmds.select(node, replace=True)
+
+    # Exit pivot editing mode by calling ctxEditMode again (it toggles)
+    # Then switch to rotate tool for normal manipulation
+    # First, make sure we're not in edit mode by switching to a fresh tool
+    mel.eval('RotateTool;')
 
 
 # -----------------------------
@@ -527,8 +556,9 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     # Set up auto-key for transform changes
     setup_auto_key(settings_node)
 
-    # Select null_grp_1 so user can start using it
-    cmds.select(null_grp_1)
+    # Exit pivot adjust mode and switch to rotate tool
+    # Use evalDeferred to ensure proper timing after constraint creation
+    cmds.evalDeferred(lambda: _exit_pivot_adjust_mode(null_grp_1))
 
     return True, f"Setup complete! Rotate pivot null to orbit '{control}' around custom pivot. Auto-key enabled.", settings_node
 
