@@ -710,6 +710,9 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
     # Update null_grp_1 color to inactive (orange)
     _set_null_color(null_grp_1, UI_COLORS["stage1"])
 
+    # Select the control now being manipulated
+    cmds.select(control, replace=True)
+
     return True, f"Pivot OFF. '{control}' is now free to move. Key if needed."
 
 
