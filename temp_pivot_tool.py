@@ -1949,10 +1949,18 @@ def _rebuild_workspace_ui() -> None:
     """Rebuild the tool UI inside an existing workspaceControl.
 
     Called by Maya's ``uiScript`` mechanism whenever the workspace
-    control is restored (e.g. after Maya restart or re-dock).  Also
-    called directly by :func:`show` on first creation.
+    control is restored (e.g. after Maya restart or re-dock).
+
+    Clears any existing children first to prevent duplicate UI when
+    Maya fires ``uiScript`` while :func:`show` also builds the UI.
     """
     _setup_undo_guard()
+    # Remove any existing child layouts to prevent duplication
+    existing = cmds.workspaceControl(
+        WORKSPACE_CONTROL_NAME, query=True, childArray=True
+    ) or []
+    for child in existing:
+        cmds.deleteUI(child)
     _build_ui(WORKSPACE_CONTROL_NAME)
 
 
@@ -2006,8 +2014,9 @@ def show() -> None:
             uiScript="import temp_pivot_tool; temp_pivot_tool._rebuild_workspace_ui()",
         )
 
-        # Build the UI inside the workspace control
-        _build_ui(WORKSPACE_CONTROL_NAME)
+        # uiScript fires automatically and builds the UI via
+        # _rebuild_workspace_ui.  No manual _build_ui call here —
+        # that would create a duplicate.
 
         # Raise / show
         cmds.workspaceControl(
