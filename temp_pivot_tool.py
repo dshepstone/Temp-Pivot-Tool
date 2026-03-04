@@ -90,12 +90,43 @@ _auto_key_jobs: Dict[str, List[int]] = {}
 # UI scriptJob IDs — killed and recreated on each _build_ui() call
 _ui_script_jobs: List[int] = []
 
+# Global UI control registry.  Callbacks resolve control paths from this
+# dict instead of capturing local variables in closures.  This means a
+# stale scriptJob can never reference a deleted control path — it will
+# either see the *current* path (valid) or an empty dict (harmless).
+_ui: Dict[str, str] = {}
+
 # Undo guard - prevents auto-key from firing during undo/redo
 _is_undoing: bool = False
 _undo_guard_jobs: List[int] = []
 
 # Debug logging — set to True for verbose output in the Script Editor
 TMP_PIVOT_DEBUG = False
+
+
+def _kill_ui_script_jobs() -> None:
+    """Kill all tracked UI scriptJobs and clear the tracking list.
+
+    Safe to call multiple times, from any context (show, on_close,
+    _build_ui, _rebuild_workspace_ui).
+    """
+    global _ui_script_jobs
+    for job_id in _ui_script_jobs:
+        try:
+            if cmds.scriptJob(exists=job_id):
+                cmds.scriptJob(kill=job_id, force=True)
+        except RuntimeError:
+            pass
+    _ui_script_jobs = []
+
+
+def _ui_exists(*keys: str) -> bool:
+    """Return True only if every *key* is in ``_ui`` and its control exists."""
+    for k in keys:
+        ctrl = _ui.get(k)
+        if not ctrl or not cmds.objExists(ctrl):
+            return False
+    return True
 
 
 def _debug_log(msg: str) -> None:
@@ -1726,14 +1757,13 @@ def _build_ui(parent_layout: str) -> None:
     idempotent — safe to call from both show() and the uiScript
     callback without producing duplicates.
     """
-    # Kill stale UI scriptJobs from a previous _build_ui() call.
-    # These reference UI elements that are about to be deleted below,
-    # so they must be killed first to prevent "Object not found" errors.
+    # Kill stale UI scriptJobs BEFORE deleting any UI elements.
+    _kill_ui_script_jobs()
+
+    # Invalidate the global UI registry so any in-flight deferred
+    # callbacks see an empty dict and bail out.
     global _ui_script_jobs
-    for job_id in _ui_script_jobs:
-        if cmds.scriptJob(exists=job_id):
-            cmds.scriptJob(kill=job_id, force=True)
-    _ui_script_jobs = []
+    _ui.clear()
 
     # Clear existing children to prevent duplicate UI.  This handles
     # the case where Maya's uiScript and show() both call _build_ui,
@@ -1816,17 +1846,21 @@ def _build_ui(parent_layout: str) -> None:
     )
 
     state_indicator = cmds.button(
+        "TMP_state_indicator",
         label="READY",
         width=60,
         height=28,
         backgroundColor=UI_COLORS["off_state"],
         enable=False
     )
+    _ui["state_indicator"] = state_indicator
 
     selection_text = cmds.text(
+        "TMP_selection_text",
         label="No control selected",
         align="left"
     )
+    _ui["selection_text"] = selection_text
 
     cmds.setParent("..")
     cmds.setParent("..")
@@ -1916,11 +1950,13 @@ def _build_ui(parent_layout: str) -> None:
     cmds.columnLayout(adjustableColumn=True, rowSpacing=4)
 
     toggle_btn = cmds.button(
+        "TMP_toggle_btn",
         label="Toggle ON / OFF",
         height=36,
         backgroundColor=UI_COLORS["success"],
         annotation=TOOLTIPS["toggle_btn"]
     )
+    _ui["toggle_btn"] = toggle_btn
 
     key_btn = cmds.button(
         label="Key Control",
@@ -2002,9 +2038,11 @@ def _build_ui(parent_layout: str) -> None:
     cmds.columnLayout(adjustableColumn=True, rowSpacing=4)
 
     rig_list = cmds.textScrollList(
+        "TMP_rig_list",
         height=100,
         allowMultiSelection=False
     )
+    _ui["rig_list"] = rig_list
 
     list_btns = cmds.rowLayout(
         numberOfColumns=3,
@@ -2046,11 +2084,13 @@ def _build_ui(parent_layout: str) -> None:
     )
 
     log_field = cmds.scrollField(
+        "TMP_log_field",
         height=80,
         editable=False,
         wordWrap=True,
         text="Ready. Select a control and click 'Create Pivot Locator'."
     )
+    _ui["log_field"] = log_field
 
     cmds.setParent("..")
 
@@ -2078,48 +2118,57 @@ def _build_ui(parent_layout: str) -> None:
     _skip_list_refresh = [False]
 
     def log_message(message: str, msg_type: str = "info") -> None:
-        prefix_map = {"warning": "[!] ", "error": "[X] ", "success": "[OK] ", "info": ""}
-        prefix = prefix_map.get(msg_type, "")
-        current = cmds.scrollField(log_field, query=True, text=True) or ""
-        new_text = f"{prefix}{message}"
-        if current and not current.startswith("Ready."):
-            new_text = f"{current}\n{new_text}"
-        cmds.scrollField(log_field, edit=True, text=new_text)
-        cmds.scrollField(log_field, edit=True, insertionPosition=len(new_text))
+        _log = _ui.get("log_field")
+        if not _log or not cmds.objExists(_log):
+            return
+        try:
+            prefix_map = {"warning": "[!] ", "error": "[X] ", "success": "[OK] ", "info": ""}
+            prefix = prefix_map.get(msg_type, "")
+            current = cmds.scrollField(_log, query=True, text=True) or ""
+            new_text = f"{prefix}{message}"
+            if current and not current.startswith("Ready."):
+                new_text = f"{current}\n{new_text}"
+            cmds.scrollField(_log, edit=True, text=new_text)
+            cmds.scrollField(_log, edit=True, insertionPosition=len(new_text))
+        except RuntimeError:
+            pass
 
     def refresh_rig_list(preserve_selection: bool = True) -> None:
         """Refresh the rig list, optionally preserving the current selection."""
-        # Guard: bail out if the UI element no longer exists (stale scriptJob).
-        if not cmds.objExists(rig_list):
+        _rlist = _ui.get("rig_list")
+        if not _rlist or not cmds.objExists(_rlist):
             return
         # Skip refresh if triggered by our own list selection
         if _skip_list_refresh[0]:
             return
 
-        # Save current selection before clearing
-        selected_control = None
-        if preserve_selection:
-            selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
-            if selected_items:
-                # Extract control name (without status suffix)
-                selected_control = selected_items[0].split(" [")[0]
+        try:
+            # Save current selection before clearing
+            selected_control = None
+            if preserve_selection:
+                selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
+                if selected_items:
+                    # Extract control name (without status suffix)
+                    selected_control = selected_items[0].split(" [")[0]
 
-        cmds.textScrollList(rig_list, edit=True, removeAll=True)
-        rigs = get_all_pivot_rigs()
-        for settings in sorted(rigs):
-            nodes = get_rig_nodes(settings)
-            control = nodes["control"] or "?"
-            active = is_rig_active(settings)
-            status = " [ON]" if active else " [OFF]"
-            cmds.textScrollList(rig_list, edit=True, append=f"{control}{status}")
+            cmds.textScrollList(_rlist, edit=True, removeAll=True)
+            rigs = get_all_pivot_rigs()
+            for settings in sorted(rigs):
+                nodes = get_rig_nodes(settings)
+                control = nodes["control"] or "?"
+                active = is_rig_active(settings)
+                status = " [ON]" if active else " [OFF]"
+                cmds.textScrollList(_rlist, edit=True, append=f"{control}{status}")
 
-        # Restore selection if we had one
-        if selected_control:
-            all_items = cmds.textScrollList(rig_list, query=True, allItems=True) or []
-            for item in all_items:
-                if item.startswith(selected_control + " ["):
-                    cmds.textScrollList(rig_list, edit=True, selectItem=item)
-                    break
+            # Restore selection if we had one
+            if selected_control:
+                all_items = cmds.textScrollList(_rlist, query=True, allItems=True) or []
+                for item in all_items:
+                    if item.startswith(selected_control + " ["):
+                        cmds.textScrollList(_rlist, edit=True, selectItem=item)
+                        break
+        except RuntimeError:
+            pass
 
     def _resolve_selection() -> List[str]:
         """
@@ -2136,77 +2185,85 @@ def _build_ui(parent_layout: str) -> None:
         return resolved
 
     def update_status() -> None:
-        # Guard: bail out if the UI element no longer exists (stale scriptJob).
-        if not cmds.objExists(selection_text):
+        # Resolve controls from the global registry — never from closures.
+        _sel_text = _ui.get("selection_text")
+        _state_btn = _ui.get("state_indicator")
+        if not _sel_text or not _state_btn:
             return
-        sel = _resolve_selection()
+        if not cmds.objExists(_sel_text) or not cmds.objExists(_state_btn):
+            return
 
-        selected_settings = None
-        pending_pivot = None
+        try:
+            sel = _resolve_selection()
 
-        for item in sel:
-            # --- TMP node: use robust resolution ---
-            if _is_tmp_node(item):
-                short_name = item.split("|")[-1]
-                # Check for pending pivot (Stage 1)
-                if short_name.endswith(NULL_GRP_1_SUFFIX):
-                    if cmds.attributeQuery("setupComplete", node=item, exists=True):
-                        if not cmds.getAttr(f"{item}.setupComplete"):
-                            pending_pivot = item
-                            break
-                # Find settings via robust helper
-                settings = _find_settings_for_node(item)
-                if settings and cmds.objExists(settings):
-                    selected_settings = settings
-                    break
-                # Last resort: resolve owner
-                owner = _resolve_owner(item)
-                if owner:
-                    rig = get_rig_for_control(owner)
-                    if rig:
-                        selected_settings = rig
+            selected_settings = None
+            pending_pivot = None
+
+            for item in sel:
+                # --- TMP node: use robust resolution ---
+                if _is_tmp_node(item):
+                    short_name = item.split("|")[-1]
+                    # Check for pending pivot (Stage 1)
+                    if short_name.endswith(NULL_GRP_1_SUFFIX):
+                        if cmds.attributeQuery("setupComplete", node=item, exists=True):
+                            if not cmds.getAttr(f"{item}.setupComplete"):
+                                pending_pivot = item
+                                break
+                    # Find settings via robust helper
+                    settings = _find_settings_for_node(item)
+                    if settings and cmds.objExists(settings):
+                        selected_settings = settings
                         break
-                continue
+                    # Last resort: resolve owner
+                    owner = _resolve_owner(item)
+                    if owner:
+                        rig = get_rig_for_control(owner)
+                        if rig:
+                            selected_settings = rig
+                            break
+                    continue
 
-            # --- Normal control ---
-            rig = get_rig_for_control(item)
-            if rig:
-                selected_settings = rig
-                break
-            short = item.split("|")[-1]
-            if short != item:
-                rig = get_rig_for_control(short)
+                # --- Normal control ---
+                rig = get_rig_for_control(item)
                 if rig:
                     selected_settings = rig
                     break
-            pending = get_pending_pivot_for_control(item)
-            if not pending and short != item:
-                pending = get_pending_pivot_for_control(short)
-            if pending:
-                pending_pivot = pending
+                short = item.split("|")[-1]
+                if short != item:
+                    rig = get_rig_for_control(short)
+                    if rig:
+                        selected_settings = rig
+                        break
+                pending = get_pending_pivot_for_control(item)
+                if not pending and short != item:
+                    pending = get_pending_pivot_for_control(short)
+                if pending:
+                    pending_pivot = pending
 
-        if selected_settings:
-            nodes = get_rig_nodes(selected_settings)
-            control = nodes["control"]
-            active = is_rig_active(selected_settings)
-            cmds.text(selection_text, edit=True, label=f"Control: {control}")
-            if active:
-                cmds.button(state_indicator, edit=True, label="ON", backgroundColor=UI_COLORS["success"])
+            if selected_settings:
+                nodes = get_rig_nodes(selected_settings)
+                control = nodes["control"]
+                active = is_rig_active(selected_settings)
+                cmds.text(_sel_text, edit=True, label=f"Control: {control}")
+                if active:
+                    cmds.button(_state_btn, edit=True, label="ON", backgroundColor=UI_COLORS["success"])
+                else:
+                    cmds.button(_state_btn, edit=True, label="OFF", backgroundColor=UI_COLORS["stage1"])
+            elif pending_pivot:
+                short_pending = pending_pivot.split("|")[-1]
+                if cmds.attributeQuery("targetControl", node=pending_pivot, exists=True):
+                    control = cmds.getAttr(f"{pending_pivot}.targetControl")
+                    cmds.text(_sel_text, edit=True, label=f"Pending: {control}")
+                cmds.button(_state_btn, edit=True, label="STAGE1", backgroundColor=UI_COLORS["stage1"])
+            elif sel:
+                display_name = sel[0].split("|")[-1]
+                cmds.text(_sel_text, edit=True, label=f"Selected: {display_name}")
+                cmds.button(_state_btn, edit=True, label="READY", backgroundColor=UI_COLORS["off_state"])
             else:
-                cmds.button(state_indicator, edit=True, label="OFF", backgroundColor=UI_COLORS["stage1"])
-        elif pending_pivot:
-            short_pending = pending_pivot.split("|")[-1]
-            if cmds.attributeQuery("targetControl", node=pending_pivot, exists=True):
-                control = cmds.getAttr(f"{pending_pivot}.targetControl")
-                cmds.text(selection_text, edit=True, label=f"Pending: {control}")
-            cmds.button(state_indicator, edit=True, label="STAGE1", backgroundColor=UI_COLORS["stage1"])
-        elif sel:
-            display_name = sel[0].split("|")[-1]
-            cmds.text(selection_text, edit=True, label=f"Selected: {display_name}")
-            cmds.button(state_indicator, edit=True, label="READY", backgroundColor=UI_COLORS["off_state"])
-        else:
-            cmds.text(selection_text, edit=True, label="No control selected")
-            cmds.button(state_indicator, edit=True, label="READY", backgroundColor=UI_COLORS["off_state"])
+                cmds.text(_sel_text, edit=True, label="No control selected")
+                cmds.button(_state_btn, edit=True, label="READY", backgroundColor=UI_COLORS["off_state"])
+        except RuntimeError:
+            pass
 
     def get_current_context():
         """Get current rig settings or pending pivot.
@@ -2368,10 +2425,12 @@ def _build_ui(parent_layout: str) -> None:
         if ctx_type == "rig":
             success, msg, is_active = toggle_pivot(ctx_node)
             log_message(msg, "success" if success else "error")
-            if is_active:
-                cmds.button(toggle_btn, edit=True, label="Toggle OFF", backgroundColor=UI_COLORS["success"])
-            else:
-                cmds.button(toggle_btn, edit=True, label="Toggle ON", backgroundColor=UI_COLORS["stage1"])
+            _tbtn = _ui.get("toggle_btn")
+            if _tbtn and cmds.objExists(_tbtn):
+                if is_active:
+                    cmds.button(_tbtn, edit=True, label="Toggle OFF", backgroundColor=UI_COLORS["success"])
+                else:
+                    cmds.button(_tbtn, edit=True, label="Toggle ON", backgroundColor=UI_COLORS["stage1"])
         elif ctx_type == "pending":
             log_message("Complete setup first before toggling.", "warning")
         else:
@@ -2456,7 +2515,10 @@ def _build_ui(parent_layout: str) -> None:
 
     def on_list_select(*args):
         """Handle selection in the rig list - select the pivot in viewport."""
-        selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
+        _rlist = _ui.get("rig_list")
+        if not _rlist or not cmds.objExists(_rlist):
+            return
+        selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
         if selected_items:
             control_name = selected_items[0].split(" [")[0]
             settings = get_rig_for_control(control_name)
@@ -2474,7 +2536,10 @@ def _build_ui(parent_layout: str) -> None:
         update_status()
 
     def on_list_toggle(*args):
-        selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
+        _rlist = _ui.get("rig_list")
+        if not _rlist or not cmds.objExists(_rlist):
+            return
+        selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
         if not selected_items:
             log_message("Select a rig from the list.", "warning")
             return
@@ -2488,7 +2553,10 @@ def _build_ui(parent_layout: str) -> None:
 
     def on_list_delete(*args):
         """Delete the rig selected in the list."""
-        selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
+        _rlist = _ui.get("rig_list")
+        if not _rlist or not cmds.objExists(_rlist):
+            return
+        selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
         if not selected_items:
             log_message("Select a rig from the list to delete.", "warning")
             return
@@ -2502,6 +2570,8 @@ def _build_ui(parent_layout: str) -> None:
 
     def on_close(*args):
         """Close the tool window / workspace control."""
+        _kill_ui_script_jobs()
+        _ui.clear()
         if (hasattr(cmds, "workspaceControl")
                 and cmds.workspaceControl(WORKSPACE_CONTROL_NAME, exists=True)):
             cmds.deleteUI(WORKSPACE_CONTROL_NAME)
@@ -2578,6 +2648,11 @@ def show() -> None:
     use_workspace = hasattr(cmds, "workspaceControl")
 
     if use_workspace:
+        # Kill scriptJobs and invalidate UI registry BEFORE deleting the
+        # workspace control so no stale callback can fire mid-teardown.
+        _kill_ui_script_jobs()
+        _ui.clear()
+
         # Always delete and recreate so the UI is fully rebuilt.
         # This guarantees the Close button (and everything else) is
         # present whether the panel is floating or docked.
@@ -2622,6 +2697,8 @@ def show() -> None:
     # ------------------------------------------------------------------
     # Fallback: plain floating window (Maya < 2017)
     # ------------------------------------------------------------------
+    _kill_ui_script_jobs()
+    _ui.clear()
     if cmds.window(WINDOW_NAME, exists=True):
         cmds.deleteUI(WINDOW_NAME)
 
