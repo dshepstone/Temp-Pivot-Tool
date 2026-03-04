@@ -158,9 +158,15 @@ TOOLTIPS = {
     "adjust_pivot_btn": (
         "Adjust the pivot position on an existing rig.\n\n"
         "1. Toggles OFF (if active) so the control is free\n"
-        "2. Makes the rig visible and selects the pivot offset\n"
-        "3. Move it to a new position with the Move tool\n"
-        "4. Click 'Toggle ON' to reactivate with the new pivot"
+        "2. Enters pivot adjust mode (same as Stage 1 D-key mode)\n"
+        "3. Move the pivot to a new position\n"
+        "4. Click 'Apply Adjustment' to re-freeze and reactivate"
+    ),
+    "apply_adjustment_btn": (
+        "Apply the repositioned pivot and reactivate the rig.\n\n"
+        "Re-freezes the pivot offset into the offset group\n"
+        "and toggles the constraint back ON so you can\n"
+        "immediately rotate around the new pivot point."
     ),
 }
 
@@ -631,6 +637,22 @@ def _set_null_color(null_grp: str, color: Tuple[float, float, float]) -> None:
             cmds.setAttr(f"{shape}.overrideColorR", color[0])
             cmds.setAttr(f"{shape}.overrideColorG", color[1])
             cmds.setAttr(f"{shape}.overrideColorB", color[2])
+
+
+def _set_shapes_visibility(node: str, visible: bool) -> None:
+    """Show or hide all shape nodes under a transform.
+
+    This hides the visual representation (ring curves, locator) while
+    keeping the transform itself active so children remain visible.
+    """
+    if not node or not cmds.objExists(node):
+        return
+    shapes = cmds.listRelatives(node, shapes=True, fullPath=True) or []
+    for shape in shapes:
+        try:
+            cmds.setAttr(f"{shape}.visibility", int(visible))
+        except RuntimeError:
+            pass
 
 
 def _enter_pivot_adjust_mode(node: str) -> None:
@@ -1151,10 +1173,12 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         cmds.setAttr(f"{settings_node}.isActive", True)
 
         # =====================================================================
-        # Show visibility
+        # Show visibility — but hide the anchor's shapes so the user only
+        # sees the pivot control (null_grp_1), not the anchor rings.
         # =====================================================================
         if null_grp_2 and cmds.objExists(null_grp_2):
             cmds.setAttr(f"{null_grp_2}.visibility", 1)
+            _set_shapes_visibility(null_grp_2, False)
         if offset_grp and cmds.objExists(offset_grp):
             cmds.setAttr(f"{offset_grp}.visibility", 1)
 
@@ -1320,15 +1344,13 @@ def toggle_pivot(settings_node: str) -> Tuple[bool, str, bool]:
 def adjust_pivot(settings_node: str) -> Tuple[bool, str]:
     """Enter pivot-adjustment mode on an existing rig.
 
-    Allows the user to reposition the pivot offset group without having
-    to delete and recreate the rig.
+    Allows the user to visually reposition the pivot point without
+    deleting and recreating the rig.  Works exactly like Stage 1:
+    selects ``null_grp_1``, activates Move tool in pivot-editing mode
+    (the **D-key** mode) so the user drags the pivot manipulator.
 
-    Process:
-    1. Toggle OFF if active (deletes constraint so control is free).
-    2. Make the pivot rig hierarchy visible.
-    3. Select the pivotOffsetGrp and activate the Move tool so the
-       user can drag it to a new position.
-    4. When satisfied, the user clicks **Toggle ON** to reactivate.
+    After repositioning, the user clicks **Apply Adjustment** to
+    re-freeze the offset and reactivate the constraint.
 
     Args:
         settings_node: The settings node for this rig.
@@ -1347,44 +1369,122 @@ def adjust_pivot(settings_node: str) -> Tuple[bool, str]:
 
     if not control or not cmds.objExists(control):
         return False, f"Control '{control}' not found."
-    if not offset_grp or not cmds.objExists(offset_grp):
-        return False, "Offset group not found. Cannot adjust pivot."
+    if not null_grp_1 or not cmds.objExists(null_grp_1):
+        return False, "Pivot null not found. Cannot adjust."
 
     cmds.undoInfo(openChunk=True, chunkName="TMP_AdjustPivot")
     try:
-        # 1. Toggle off if active
+        # 1. Toggle off if active (delete constraint so control is free)
         if is_rig_active(settings_node):
             toggle_off(settings_node)
-            # Re-resolve names after toggle_off (DAG paths may change)
+            # Re-resolve after DAG path changes
             nodes = get_rig_nodes(settings_node)
             offset_grp = nodes["pivot_offset_grp"]
             null_grp_1 = nodes["null_grp_1"]
             null_grp_2 = nodes["null_grp_2"]
-            if not offset_grp or not cmds.objExists(offset_grp):
-                return False, "Offset group lost after toggle off."
+            if not null_grp_1 or not cmds.objExists(null_grp_1):
+                return False, "Pivot null lost after toggle off."
 
-        # 2. Make the rig visible so the user can see the pivot
+        # 2. Make rig visible so user can see the pivot control
         if null_grp_2 and cmds.objExists(null_grp_2):
             cmds.setAttr(f"{null_grp_2}.visibility", 1)
+            _set_shapes_visibility(null_grp_2, False)
         if offset_grp and cmds.objExists(offset_grp):
             cmds.setAttr(f"{offset_grp}.visibility", 1)
 
-        # Color the pivot null orange to indicate adjustment mode
+        # 3. Color the pivot null yellow to indicate adjustment mode
         if null_grp_1 and cmds.objExists(null_grp_1):
             _set_null_color(null_grp_1, UI_COLORS["warning"])
 
-        # 3. Select the offset group and activate Move tool
-        cmds.select(offset_grp, replace=True)
-        cmds.setToolTo("moveSuperContext")
+        # 4. Select null_grp_1 and enter pivot-editing mode
+        #    (same as Stage 1 — D-key / ctxEditMode with Move tool)
+        cmds.evalDeferred(lambda n=null_grp_1: _enter_pivot_adjust_mode(n))
 
         _debug_log(
             f"adjust_pivot: entered adjust mode for '{control}', "
-            f"selected '{offset_grp}'"
+            f"selected '{null_grp_1}'"
         )
 
         return True, (
             f"Adjust mode for '{control}'. "
-            "Move the pivot null to a new position, then click 'Toggle ON' to reactivate."
+            "Move the pivot to a new position, then click 'Apply Adjustment'."
+        )
+    finally:
+        cmds.undoInfo(closeChunk=True)
+
+
+def apply_pivot_adjustment(settings_node: str) -> Tuple[bool, str]:
+    """Apply a pivot repositioning and reactivate the rig.
+
+    Re-freezes the pivot offset (same maths as Stage 2) and then
+    toggles the rig back ON so the user can immediately rotate
+    around the new pivot.
+
+    Args:
+        settings_node: The settings node for this rig.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    if not cmds.objExists(settings_node):
+        return False, "Settings node not found."
+
+    nodes = get_rig_nodes(settings_node)
+    control = nodes["control"]
+    null_grp_1 = nodes["null_grp_1"]
+    offset_grp = nodes["pivot_offset_grp"]
+
+    if not control or not cmds.objExists(control):
+        return False, f"Control '{control}' not found."
+    if not null_grp_1 or not cmds.objExists(null_grp_1):
+        return False, "Pivot null not found."
+    if not offset_grp or not cmds.objExists(offset_grp):
+        return False, "Offset group not found."
+
+    cmds.undoInfo(openChunk=True, chunkName="TMP_ApplyPivotAdjustment")
+    try:
+        # Exit pivot adjust mode if active
+        try:
+            mel.eval('ctxEditMode;')
+        except Exception:
+            pass
+        try:
+            mel.eval('SelectTool;')
+        except Exception:
+            pass
+
+        # -----------------------------------------------------------------
+        # Re-freeze: update pivotOffsetGrp position from the new pivot
+        # -----------------------------------------------------------------
+        pivot_ws = cmds.xform(null_grp_1, q=True, ws=True, rotatePivot=True)
+
+        # Move offset_grp to the new world-space pivot position
+        cmds.xform(offset_grp, ws=True, t=pivot_ws)
+
+        # Copy rotation from null_grp_1 (same orient as before)
+        null_rot = cmds.xform(null_grp_1, q=True, ws=True, ro=True)
+        cmds.xform(offset_grp, ws=True, ro=null_rot)
+
+        # Zero null_grp_1's local transforms and pivots (freeze)
+        for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
+            _safe_set_attr(null_grp_1, attr, 0)
+        cmds.xform(null_grp_1, objectSpace=True, pivots=[0, 0, 0])
+
+        _debug_log(
+            f"apply_pivot_adjustment: re-froze pivot at {pivot_ws} "
+            f"for '{control}'"
+        )
+
+        # -----------------------------------------------------------------
+        # Toggle ON to reactivate constraint
+        # -----------------------------------------------------------------
+        success, msg = toggle_on(settings_node)
+        if not success:
+            return False, f"Re-freeze done but toggle ON failed: {msg}"
+
+        return True, (
+            f"Pivot adjusted and reactivated for '{control}'. "
+            "Rotate the pivot null to orbit around the new pivot point."
         )
     finally:
         cmds.undoInfo(closeChunk=True)
@@ -1832,12 +1932,27 @@ def _build_ui(parent_layout: str) -> None:
 
     cmds.setParent("..")
 
+    adjust_row = cmds.rowLayout(
+        numberOfColumns=2,
+        adjustableColumn=1,
+        columnWidth2=(160, 160)
+    )
+
     adjust_pivot_btn = cmds.button(
-        label="Adjust Pivot Position",
+        label="Adjust Pivot",
         height=28,
         backgroundColor=UI_COLORS["warning"],
         annotation=TOOLTIPS["adjust_pivot_btn"]
     )
+
+    apply_adjustment_btn = cmds.button(
+        label="Apply Adjustment",
+        height=28,
+        backgroundColor=UI_COLORS["success"],
+        annotation=TOOLTIPS["apply_adjustment_btn"]
+    )
+
+    cmds.setParent("..")
 
     cmds.separator(height=4, style="none")
 
@@ -2259,6 +2374,16 @@ def _build_ui(parent_layout: str) -> None:
         else:
             log_message("No pivot rig found. Create one first.", "warning")
 
+    def on_apply_adjustment(*args):
+        ctx_type, ctx_node = get_current_context()
+        if ctx_type == "rig":
+            success, msg = apply_pivot_adjustment(ctx_node)
+            log_message(msg, "success" if success else "error")
+            refresh_rig_list()
+            update_status()
+        else:
+            log_message("No pivot rig found to apply adjustment to.", "warning")
+
     def on_delete(*args):
         ctx_type, ctx_node = get_current_context()
         if ctx_type == "rig":
@@ -2364,6 +2489,7 @@ def _build_ui(parent_layout: str) -> None:
     cmds.button(toggle_btn, edit=True, command=on_toggle)
     cmds.button(key_btn, edit=True, command=on_key)
     cmds.button(adjust_pivot_btn, edit=True, command=on_adjust_pivot)
+    cmds.button(apply_adjustment_btn, edit=True, command=on_apply_adjustment)
     cmds.button(delete_btn, edit=True, command=on_delete)
     cmds.button(select_pivot_btn, edit=True, command=on_select_pivot)
     cmds.button(select_control_btn, edit=True, command=on_select_control)
