@@ -34,7 +34,7 @@ Features:
 
 Author: David Shepstone
 License: MIT
-Version: 7.0.0
+Version: 7.1.0
 
 Upgrade notes from v6:
   - null_group_1 now has zeroed rotatePivot/scalePivot (pivot offset baked into pivotOffsetGrp)
@@ -68,12 +68,71 @@ OFFSET_GRP_SUFFIX = f"_{TOOL_PREFIX}_pivotOffset"  # Offset group - stores baked
 SETTINGS_SUFFIX = f"_{TOOL_PREFIX}_settings"
 CONSTRAINT_SUFFIX = f"_{TOOL_PREFIX}_parentConstraint"
 
+# Message attribute name stored on the owner control pointing at the settings node
+MSG_ATTR_SETTINGS = "tmpPivotSettings"
+
+# All known TMP suffixes for legacy owner resolution (longest first)
+_ALL_TMP_SUFFIXES = [
+    CONSTRAINT_SUFFIX,       # _TMP_parentConstraint
+    OFFSET_GRP_SUFFIX,       # _TMP_pivotOffset
+    f"{NULL_GRP_1_SUFFIX}_ringX",
+    f"{NULL_GRP_1_SUFFIX}_ringY",
+    f"{NULL_GRP_1_SUFFIX}_ringZ",
+    f"{NULL_GRP_1_SUFFIX}_loc",
+    SETTINGS_SUFFIX,         # _TMP_settings
+    NULL_GRP_2_SUFFIX,       # _TMP_anchor
+    NULL_GRP_1_SUFFIX,       # _TMP_pivot
+]
+
 # Auto-key scriptJob storage (keyed by settings node name)
 _auto_key_jobs: Dict[str, List[int]] = {}
+
+# UI scriptJob IDs — killed and recreated on each _build_ui() call
+_ui_script_jobs: List[int] = []
+
+# Global UI control registry.  Callbacks resolve control paths from this
+# dict instead of capturing local variables in closures.  This means a
+# stale scriptJob can never reference a deleted control path — it will
+# either see the *current* path (valid) or an empty dict (harmless).
+_ui: Dict[str, str] = {}
 
 # Undo guard - prevents auto-key from firing during undo/redo
 _is_undoing: bool = False
 _undo_guard_jobs: List[int] = []
+
+# Debug logging — set to True for verbose output in the Script Editor
+TMP_PIVOT_DEBUG = False
+
+
+def _kill_ui_script_jobs() -> None:
+    """Kill all tracked UI scriptJobs and clear the tracking list.
+
+    Safe to call multiple times, from any context (show, on_close,
+    _build_ui, _rebuild_workspace_ui).
+    """
+    global _ui_script_jobs
+    for job_id in _ui_script_jobs:
+        try:
+            if cmds.scriptJob(exists=job_id):
+                cmds.scriptJob(kill=job_id, force=True)
+        except RuntimeError:
+            pass
+    _ui_script_jobs = []
+
+
+def _ui_exists(*keys: str) -> bool:
+    """Return True only if every *key* is in ``_ui`` and its control exists."""
+    for k in keys:
+        ctrl = _ui.get(k)
+        if not ctrl or not cmds.objExists(ctrl):
+            return False
+    return True
+
+
+def _debug_log(msg: str) -> None:
+    """Print a debug message if TMP_PIVOT_DEBUG is enabled."""
+    if TMP_PIVOT_DEBUG:
+        print(f"[TMP_PIVOT_DEBUG] {msg}")
 
 # UI Colors
 UI_COLORS = {
@@ -126,6 +185,19 @@ TOOLTIPS = {
     "select_control_btn": (
         "Select the original control.\n"
         "Useful for keying or checking values."
+    ),
+    "adjust_pivot_btn": (
+        "Adjust the pivot position on an existing rig.\n\n"
+        "1. Toggles OFF (if active) so the control is free\n"
+        "2. Enters pivot adjust mode (same as Stage 1 D-key mode)\n"
+        "3. Move the pivot to a new position\n"
+        "4. Click 'Apply Adjustment' to re-freeze and reactivate"
+    ),
+    "apply_adjustment_btn": (
+        "Apply the repositioned pivot and reactivate the rig.\n\n"
+        "Re-freezes the pivot offset into the offset group\n"
+        "and toggles the constraint back ON so you can\n"
+        "immediately rotate around the new pivot point."
     ),
 }
 
@@ -207,6 +279,204 @@ def _resolve_transform(node: str) -> str:
     return node
 
 
+def _is_tmp_node(node: str) -> bool:
+    """Return True if *node* belongs to a TMP pivot rig (by name convention)."""
+    short = node.split("|")[-1]
+    return f"_{TOOL_PREFIX}_" in short
+
+
+def _find_settings_for_node(node: str) -> Optional[str]:
+    """Find the TMP settings node associated with *any* node (TMP or control).
+
+    Resolution order:
+    1. If *node* itself is a settings node, return it.
+    2. If *node* has ``targetControl`` attr (it's a pivot null), derive settings.
+    3. Walk parent hierarchy looking for settings node or targetControl attr.
+    4. Message attribute on the owner (``tmpPivotSettings``).
+    5. Suffix-strip the name to guess the settings node.
+    6. Scan all settings nodes in the scene for a matching rig member.
+    """
+    if not node or not cmds.objExists(node):
+        return None
+
+    node = _resolve_transform(node)
+    short_name = node.split("|")[-1]
+
+    # 1. Node IS the settings node
+    if short_name.endswith(SETTINGS_SUFFIX):
+        _debug_log(f"_find_settings_for_node: '{node}' is a settings node")
+        return node
+
+    # 2. Node has targetControl (pivot null or anchor)
+    if cmds.attributeQuery("targetControl", node=node, exists=True):
+        target = cmds.getAttr(f"{node}.targetControl") or ""
+        if target:
+            prefix = _sanitize_name(target)
+            candidate = f"{prefix}{SETTINGS_SUFFIX}"
+            resolved = _resolve_stored_name(candidate)
+            if resolved:
+                _debug_log(f"_find_settings_for_node: via targetControl → '{resolved}'")
+                return resolved
+
+    # 3. Walk parent hierarchy
+    current = node
+    for _ in range(10):
+        parents = cmds.listRelatives(current, parent=True, fullPath=True) or []
+        if not parents:
+            break
+        current = parents[0]
+        current_short = current.split("|")[-1]
+        if current_short.endswith(SETTINGS_SUFFIX):
+            _debug_log(f"_find_settings_for_node: parent walk found '{current}'")
+            return current
+        if cmds.attributeQuery("targetControl", node=current, exists=True):
+            target = cmds.getAttr(f"{current}.targetControl") or ""
+            if target:
+                prefix = _sanitize_name(target)
+                candidate = f"{prefix}{SETTINGS_SUFFIX}"
+                resolved = _resolve_stored_name(candidate)
+                if resolved:
+                    _debug_log(f"_find_settings_for_node: parent targetControl → '{resolved}'")
+                    return resolved
+        # Check siblings for settings node
+        children = cmds.listRelatives(current, children=True, type="transform") or []
+        for child in children:
+            if child.endswith(SETTINGS_SUFFIX):
+                _debug_log(f"_find_settings_for_node: sibling settings → '{child}'")
+                return child
+
+    # 4. Message attribute on owner
+    owner = _resolve_owner_name_only(node)
+    if owner and cmds.objExists(owner):
+        if cmds.attributeQuery(MSG_ATTR_SETTINGS, node=owner, exists=True):
+            connections = cmds.listConnections(
+                f"{owner}.{MSG_ATTR_SETTINGS}", source=True, destination=False
+            ) or []
+            for conn in connections:
+                if cmds.objExists(conn):
+                    _debug_log(f"_find_settings_for_node: message attr → '{conn}'")
+                    return conn
+
+    # 5. Suffix-strip to guess settings name
+    candidate_prefix = short_name
+    for suffix in _ALL_TMP_SUFFIXES:
+        if candidate_prefix.endswith(suffix):
+            candidate_prefix = candidate_prefix[: -len(suffix)]
+            break
+    if candidate_prefix != short_name:
+        possible = f"{candidate_prefix}{SETTINGS_SUFFIX}"
+        resolved = _resolve_stored_name(possible)
+        if resolved:
+            _debug_log(f"_find_settings_for_node: suffix-strip → '{resolved}'")
+            return resolved
+
+    # 6. Control lookup — maybe *node* is the owner control itself
+    settings = get_rig_for_control(node)
+    if settings:
+        return settings
+    short_only = node.split("|")[-1]
+    if short_only != node:
+        settings = get_rig_for_control(short_only)
+        if settings:
+            return settings
+
+    _debug_log(f"_find_settings_for_node: no settings found for '{node}'")
+    return None
+
+
+def _resolve_owner_name_only(node: str) -> Optional[str]:
+    """Best-effort owner name derivation using only naming convention (no scene queries).
+
+    This is a lightweight helper used by ``_find_settings_for_node`` to avoid
+    infinite recursion (it does NOT call ``_find_settings_for_node``).
+    """
+    short = node.split("|")[-1]
+    for suffix in _ALL_TMP_SUFFIXES:
+        if short.endswith(suffix):
+            candidate = short[: -len(suffix)]
+            if candidate:
+                return candidate
+    return None
+
+
+def _resolve_owner(node: str) -> Optional[str]:
+    """Resolve any node (TMP, shape, or control) to the real owner control.
+
+    Handles:
+    - Shape nodes → parent transform first.
+    - Settings nodes → read targetControl.
+    - Any TMP hierarchy node → walk up / suffix-strip to find owner.
+    - Controls → returned as-is if they exist.
+    - Namespaced / referenced nodes.
+
+    Returns the owner control name or ``None``.
+    """
+    if not node or not cmds.objExists(node):
+        _debug_log(f"_resolve_owner: '{node}' does not exist")
+        return None
+
+    node = _resolve_transform(node)
+    short_name = node.split("|")[-1]
+
+    # Fast path: node is not a TMP node at all — it's likely the owner itself
+    if not _is_tmp_node(node):
+        _debug_log(f"_resolve_owner: '{node}' is not a TMP node → treating as owner")
+        return node
+
+    # --- TMP node path ---
+
+    # A. Check if node has targetControl directly
+    if cmds.attributeQuery("targetControl", node=node, exists=True):
+        owner = cmds.getAttr(f"{node}.targetControl") or ""
+        if owner and cmds.objExists(owner):
+            _debug_log(f"_resolve_owner: targetControl on node → '{owner}'")
+            return owner
+
+    # B. Walk up parent hierarchy for targetControl
+    current = node
+    for _ in range(10):
+        parents = cmds.listRelatives(current, parent=True, fullPath=True) or []
+        if not parents:
+            break
+        current = parents[0]
+        if cmds.attributeQuery("targetControl", node=current, exists=True):
+            owner = cmds.getAttr(f"{current}.targetControl") or ""
+            if owner and cmds.objExists(owner):
+                _debug_log(f"_resolve_owner: parent walk targetControl → '{owner}'")
+                return owner
+
+    # C. Find the settings node and read targetControl from it
+    settings = _find_settings_for_node(node)
+    if settings and cmds.objExists(settings):
+        if cmds.attributeQuery("targetControl", node=settings, exists=True):
+            owner = cmds.getAttr(f"{settings}.targetControl") or ""
+            if owner and cmds.objExists(owner):
+                _debug_log(f"_resolve_owner: via settings '{settings}' → '{owner}'")
+                return owner
+
+    # D. Legacy fallback: strip known suffixes
+    candidate = short_name
+    for suffix in _ALL_TMP_SUFFIXES:
+        if candidate.endswith(suffix):
+            candidate = candidate[: -len(suffix)]
+            break
+    if candidate and candidate != short_name:
+        if cmds.objExists(candidate):
+            _debug_log(f"_resolve_owner: suffix-strip → '{candidate}'")
+            return candidate
+        # Try with wildcard namespace search
+        matches = cmds.ls(f"*:{candidate}", type="transform") or []
+        if len(matches) == 1:
+            _debug_log(f"_resolve_owner: namespace search → '{matches[0]}'")
+            return matches[0]
+        if matches:
+            _debug_log(f"_resolve_owner: ambiguous namespace, using first → '{matches[0]}'")
+            return matches[0]
+
+    _debug_log(f"_resolve_owner: could not resolve owner for '{node}'")
+    return None
+
+
 def _align_to_target_world_matrix(object_to_align: str, target: str) -> None:
     """
     Align object_to_align to target's world-space transform using world matrix.
@@ -229,6 +499,20 @@ def _align_to_target_world_matrix(object_to_align: str, target: str) -> None:
             matrix[12], matrix[13], matrix[14], matrix[15]
         ]
     )
+
+
+def _align_translate_rotate(source: str, target: str) -> None:
+    """
+    Align *source* to *target*'s world-space position and rotation only.
+
+    Unlike ``_align_to_target_world_matrix``, this does **not** copy scale,
+    avoiding scale-compensation issues when children are reparented under
+    the aligned node.
+    """
+    pos = cmds.xform(target, q=True, ws=True, t=True)
+    rot = cmds.xform(target, q=True, ws=True, ro=True)
+    cmds.xform(source, ws=True, t=pos)
+    cmds.xform(source, ws=True, ro=rot)
 
 
 def _match_translation_world(source: str, target: str) -> None:
@@ -400,6 +684,22 @@ def _set_null_color(null_grp: str, color: Tuple[float, float, float]) -> None:
             cmds.setAttr(f"{shape}.overrideColorB", color[2])
 
 
+def _set_shapes_visibility(node: str, visible: bool) -> None:
+    """Show or hide all shape nodes under a transform.
+
+    This hides the visual representation (ring curves, locator) while
+    keeping the transform itself active so children remain visible.
+    """
+    if not node or not cmds.objExists(node):
+        return
+    shapes = cmds.listRelatives(node, shapes=True, fullPath=True) or []
+    for shape in shapes:
+        try:
+            cmds.setAttr(f"{shape}.visibility", int(visible))
+        except RuntimeError:
+            pass
+
+
 def _enter_pivot_adjust_mode(node: str) -> None:
     """
     Enter custom pivot editing mode with the translate tool active on the given node.
@@ -429,7 +729,25 @@ def get_all_pivot_rigs() -> List[str]:
 
 
 def get_rig_for_control(control: str) -> Optional[str]:
-    """Find the settings node for a given control, if one exists."""
+    """Find the settings node for a given control, if one exists.
+
+    Checks the message attribute ``tmpPivotSettings`` first for O(1) lookup,
+    then falls back to scanning all settings nodes (legacy scenes).
+    """
+    if not control or not cmds.objExists(control):
+        return None
+
+    # Fast path: message attribute on the owner
+    if cmds.attributeQuery(MSG_ATTR_SETTINGS, node=control, exists=True):
+        connections = cmds.listConnections(
+            f"{control}.{MSG_ATTR_SETTINGS}", source=True, destination=False
+        ) or []
+        for conn in connections:
+            if cmds.objExists(conn):
+                _debug_log(f"get_rig_for_control: message attr → '{conn}'")
+                return conn
+
+    # Fallback: scan all settings nodes
     settings_nodes = get_all_pivot_rigs()
     for settings in settings_nodes:
         if cmds.attributeQuery("targetControl", node=settings, exists=True):
@@ -558,6 +876,13 @@ def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
     # Ensure it's a transform node
     if cmds.nodeType(control) != "transform":
         return False, f"'{control}' is not a transform node.", None
+
+    # Guard: reject TMP nodes to prevent "pivot-of-pivot"
+    if _is_tmp_node(control):
+        owner = _resolve_owner(control)
+        owner_msg = f" (owner: '{owner}')" if owner else ""
+        _debug_log(f"create_pivot_locator: rejected TMP node '{control}'{owner_msg}")
+        return False, f"'{control}' is a TMP rig node, not a control{owner_msg}. Select the original control instead.", None
 
     cmds.undoInfo(openChunk=True, chunkName="TMP_CreatePivotLocator")
     try:
@@ -753,6 +1078,23 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         # Re-resolve settings_node after reparenting (DAG path changed)
         settings_node = _resolve_stored_name(settings_node.split("|")[-1])
 
+        # ------------------------------------------------------------------
+        # Deterministic tracking: message attribute on owner → settings node
+        # ------------------------------------------------------------------
+        if not cmds.attributeQuery(MSG_ATTR_SETTINGS, node=control, exists=True):
+            cmds.addAttr(control, longName=MSG_ATTR_SETTINGS, attributeType="message")
+        # Disconnect any stale connection first
+        existing_conns = cmds.listConnections(
+            f"{control}.{MSG_ATTR_SETTINGS}", source=True, destination=False, plugs=True
+        ) or []
+        for plug in existing_conns:
+            try:
+                cmds.disconnectAttr(plug, f"{control}.{MSG_ATTR_SETTINGS}")
+            except RuntimeError:
+                pass
+        cmds.connectAttr(f"{settings_node}.message", f"{control}.{MSG_ATTR_SETTINGS}", force=True)
+        _debug_log(f"complete_setup: connected {settings_node}.message → {control}.{MSG_ATTR_SETTINGS}")
+
         # Mark null_grp_1 setup as complete
         cmds.setAttr(f"{null_grp_1}.setupComplete", True)
 
@@ -763,20 +1105,11 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         _setup_undo_guard()
         setup_auto_key(settings_node)
 
-        # Select null_grp_1 with the Rotate manipulator so the user can
-        # start orbiting immediately.  Double-deferred ensures it sticks
-        # after all UI refreshes and SelectionChanged scriptJobs settle.
+        # Select null_grp_1 so the user sees it in the viewport.
+        # Do NOT force a tool context here — the UI callback
+        # (_deferred_select_pivot) handles the final selection and lets
+        # the user keep whichever manipulator they prefer (Rotate or Move).
         cmds.select(null_grp_1)
-        cmds.setToolTo("RotateSuperContext")
-        _deferred_node = null_grp_1  # capture for lambda
-        cmds.evalDeferred(
-            lambda n=_deferred_node: cmds.evalDeferred(
-                lambda: (
-                    cmds.select(n, replace=True),
-                    cmds.setToolTo("RotateSuperContext"),
-                ) if cmds.objExists(n) else None
-            )
-        )
 
         return True, f"Setup complete! Rotate pivot null to orbit '{control}' around custom pivot. Auto-key enabled.", settings_node
     finally:
@@ -826,9 +1159,12 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     cmds.undoInfo(openChunk=True, chunkName="TMP_ToggleOn")
     try:
         # =====================================================================
-        # Realign null_group_2 to control's current world position/rotation
+        # Realign null_group_2 to control's current world position/rotation.
+        # Use position+rotation only (no scale) to avoid scale-compensation
+        # issues when children are reparented under null_grp_2.
         # =====================================================================
-        _align_to_target_world_matrix(null_grp_2, control)
+        _align_translate_rotate(null_grp_2, control)
+        cmds.xform(null_grp_2, ws=False, s=[1, 1, 1])
 
         # =====================================================================
         # Handle v7 (with offset group) or v6 (without) hierarchy
@@ -876,10 +1212,12 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
         cmds.setAttr(f"{settings_node}.isActive", True)
 
         # =====================================================================
-        # Show visibility
+        # Show visibility — but hide the anchor's shapes so the user only
+        # sees the pivot control (null_grp_1), not the anchor rings.
         # =====================================================================
         if null_grp_2 and cmds.objExists(null_grp_2):
             cmds.setAttr(f"{null_grp_2}.visibility", 1)
+            _set_shapes_visibility(null_grp_2, False)
         if offset_grp and cmds.objExists(offset_grp):
             cmds.setAttr(f"{offset_grp}.visibility", 1)
 
@@ -972,9 +1310,12 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
             cmds.setAttr(f"{settings_node}.nullGrp2", null_grp_2, type="string")
 
         # =====================================================================
-        # Align null_group_2 to control's current world position/rotation
+        # Align null_group_2 to control's current world position/rotation.
+        # Use position+rotation only (no scale) to avoid scale-compensation
+        # issues when children are reparented under null_grp_2.
         # =====================================================================
-        _align_to_target_world_matrix(null_grp_2, control)
+        _align_translate_rotate(null_grp_2, control)
+        cmds.xform(null_grp_2, ws=False, s=[1, 1, 1])
 
         # =====================================================================
         # Parent hierarchy under null_group_2
@@ -1036,6 +1377,159 @@ def toggle_pivot(settings_node: str) -> Tuple[bool, str, bool]:
     else:
         success, msg = toggle_on(settings_node)
         return success, msg, True
+
+
+# =============================================================================
+# ADJUST PIVOT POSITION
+# =============================================================================
+
+def adjust_pivot(settings_node: str) -> Tuple[bool, str]:
+    """Enter pivot-adjustment mode on an existing rig.
+
+    Allows the user to visually reposition the pivot point without
+    deleting and recreating the rig.  Works exactly like Stage 1:
+    selects ``null_grp_1``, activates Move tool in pivot-editing mode
+    (the **D-key** mode) so the user drags the pivot manipulator.
+
+    After repositioning, the user clicks **Apply Adjustment** to
+    re-freeze the offset and reactivate the constraint.
+
+    Args:
+        settings_node: The settings node for this rig.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    if not cmds.objExists(settings_node):
+        return False, "Settings node not found."
+
+    nodes = get_rig_nodes(settings_node)
+    control = nodes["control"]
+    offset_grp = nodes["pivot_offset_grp"]
+    null_grp_1 = nodes["null_grp_1"]
+    null_grp_2 = nodes["null_grp_2"]
+
+    if not control or not cmds.objExists(control):
+        return False, f"Control '{control}' not found."
+    if not null_grp_1 or not cmds.objExists(null_grp_1):
+        return False, "Pivot null not found. Cannot adjust."
+
+    cmds.undoInfo(openChunk=True, chunkName="TMP_AdjustPivot")
+    try:
+        # 1. Toggle off if active (delete constraint so control is free)
+        if is_rig_active(settings_node):
+            toggle_off(settings_node)
+            # Re-resolve after DAG path changes
+            nodes = get_rig_nodes(settings_node)
+            offset_grp = nodes["pivot_offset_grp"]
+            null_grp_1 = nodes["null_grp_1"]
+            null_grp_2 = nodes["null_grp_2"]
+            if not null_grp_1 or not cmds.objExists(null_grp_1):
+                return False, "Pivot null lost after toggle off."
+
+        # 2. Make rig visible so user can see the pivot control
+        if null_grp_2 and cmds.objExists(null_grp_2):
+            cmds.setAttr(f"{null_grp_2}.visibility", 1)
+            _set_shapes_visibility(null_grp_2, False)
+        if offset_grp and cmds.objExists(offset_grp):
+            cmds.setAttr(f"{offset_grp}.visibility", 1)
+
+        # 3. Color the pivot null yellow to indicate adjustment mode
+        if null_grp_1 and cmds.objExists(null_grp_1):
+            _set_null_color(null_grp_1, UI_COLORS["warning"])
+
+        # 4. Select null_grp_1 and enter pivot-editing mode
+        #    (same as Stage 1 — D-key / ctxEditMode with Move tool)
+        cmds.evalDeferred(lambda n=null_grp_1: _enter_pivot_adjust_mode(n))
+
+        _debug_log(
+            f"adjust_pivot: entered adjust mode for '{control}', "
+            f"selected '{null_grp_1}'"
+        )
+
+        return True, (
+            f"Adjust mode for '{control}'. "
+            "Move the pivot to a new position, then click 'Apply Adjustment'."
+        )
+    finally:
+        cmds.undoInfo(closeChunk=True)
+
+
+def apply_pivot_adjustment(settings_node: str) -> Tuple[bool, str]:
+    """Apply a pivot repositioning and reactivate the rig.
+
+    Re-freezes the pivot offset (same maths as Stage 2) and then
+    toggles the rig back ON so the user can immediately rotate
+    around the new pivot.
+
+    Args:
+        settings_node: The settings node for this rig.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    if not cmds.objExists(settings_node):
+        return False, "Settings node not found."
+
+    nodes = get_rig_nodes(settings_node)
+    control = nodes["control"]
+    null_grp_1 = nodes["null_grp_1"]
+    offset_grp = nodes["pivot_offset_grp"]
+
+    if not control or not cmds.objExists(control):
+        return False, f"Control '{control}' not found."
+    if not null_grp_1 or not cmds.objExists(null_grp_1):
+        return False, "Pivot null not found."
+    if not offset_grp or not cmds.objExists(offset_grp):
+        return False, "Offset group not found."
+
+    cmds.undoInfo(openChunk=True, chunkName="TMP_ApplyPivotAdjustment")
+    try:
+        # Exit pivot adjust mode if active
+        try:
+            mel.eval('ctxEditMode;')
+        except Exception:
+            pass
+        try:
+            mel.eval('SelectTool;')
+        except Exception:
+            pass
+
+        # -----------------------------------------------------------------
+        # Re-freeze: update pivotOffsetGrp position from the new pivot
+        # -----------------------------------------------------------------
+        pivot_ws = cmds.xform(null_grp_1, q=True, ws=True, rotatePivot=True)
+
+        # Move offset_grp to the new world-space pivot position
+        cmds.xform(offset_grp, ws=True, t=pivot_ws)
+
+        # Copy rotation from null_grp_1 (same orient as before)
+        null_rot = cmds.xform(null_grp_1, q=True, ws=True, ro=True)
+        cmds.xform(offset_grp, ws=True, ro=null_rot)
+
+        # Zero null_grp_1's local transforms and pivots (freeze)
+        for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
+            _safe_set_attr(null_grp_1, attr, 0)
+        cmds.xform(null_grp_1, objectSpace=True, pivots=[0, 0, 0])
+
+        _debug_log(
+            f"apply_pivot_adjustment: re-froze pivot at {pivot_ws} "
+            f"for '{control}'"
+        )
+
+        # -----------------------------------------------------------------
+        # Toggle ON to reactivate constraint
+        # -----------------------------------------------------------------
+        success, msg = toggle_on(settings_node)
+        if not success:
+            return False, f"Re-freeze done but toggle ON failed: {msg}"
+
+        return True, (
+            f"Pivot adjusted and reactivated for '{control}'. "
+            "Rotate the pivot null to orbit around the new pivot point."
+        )
+    finally:
+        cmds.undoInfo(closeChunk=True)
 
 
 # =============================================================================
@@ -1145,47 +1639,77 @@ def cleanup_auto_key(settings_node: str) -> None:
 # =============================================================================
 
 def delete_pivot_rig(settings_node: str) -> Tuple[bool, str]:
-    """Delete the pivot rig completely."""
+    """Delete the pivot rig completely.
+
+    Idempotent — safe to call even if some rig nodes are already gone.
+    Handles referenced nodes gracefully (warns instead of erroring).
+    Cleans up the message attribute on the owner control.
+    """
     if not cmds.objExists(settings_node):
         return False, "Settings node not found."
 
     nodes = get_rig_nodes(settings_node)
     control = nodes["control"]
+    _debug_log(f"delete_pivot_rig: settings='{settings_node}', control='{control}'")
 
     cmds.undoInfo(openChunk=True, chunkName="TMP_DeletePivotRig")
     try:
         # Clean up auto-key scriptJobs (in case they exist)
         cleanup_auto_key(settings_node)
 
-        # Toggle off first
+        # Toggle off first (deletes constraint)
         if is_rig_active(settings_node):
             toggle_off(settings_node)
 
+        # Helper to delete a node safely (handles referenced / locked nodes)
+        def _safe_delete(node_name: str) -> None:
+            if not node_name or not cmds.objExists(node_name):
+                return
+            try:
+                if cmds.referenceQuery(node_name, isNodeReferenced=True):
+                    _debug_log(f"delete_pivot_rig: '{node_name}' is referenced, skipping delete")
+                    cmds.warning(f"Cannot delete referenced node '{node_name}'. Remove the reference first.")
+                    return
+            except RuntimeError:
+                pass  # not referenced
+            try:
+                cmds.delete(node_name)
+                _debug_log(f"delete_pivot_rig: deleted '{node_name}'")
+            except RuntimeError as exc:
+                cmds.warning(f"Could not delete '{node_name}': {exc}")
+
+        # Re-query nodes after toggle_off (DAG paths may have changed)
+        nodes = get_rig_nodes(settings_node) if cmds.objExists(settings_node) else nodes
+
         # Delete null_group_2 (which parents everything else in v7)
-        null_grp_2 = nodes["null_grp_2"]
-        if null_grp_2 and cmds.objExists(null_grp_2):
-            cmds.delete(null_grp_2)
+        _safe_delete(nodes.get("null_grp_2"))
 
         # Delete offset group if it wasn't parented under null_group_2
-        offset_grp = nodes["pivot_offset_grp"]
-        if offset_grp and cmds.objExists(offset_grp):
-            cmds.delete(offset_grp)
+        _safe_delete(nodes.get("pivot_offset_grp"))
 
         # Delete null_group_1 if it wasn't parented under null_group_2 or offset_grp
-        null_grp_1 = nodes["null_grp_1"]
-        if null_grp_1 and cmds.objExists(null_grp_1):
-            cmds.delete(null_grp_1)
+        _safe_delete(nodes.get("null_grp_1"))
 
         # Clean up orphaned settings node
-        if cmds.objExists(settings_node):
-            cmds.delete(settings_node)
+        _safe_delete(settings_node)
 
-        # Remove any remaining constraints
+        # Remove any remaining TMP constraints on the control
         if control and cmds.objExists(control):
             constraints = cmds.listRelatives(control, type="parentConstraint") or []
             for c in constraints:
                 if CONSTRAINT_SUFFIX in c or TOOL_PREFIX in c:
-                    cmds.delete(c)
+                    _safe_delete(c)
+
+        # ------------------------------------------------------------------
+        # Clean up message attribute on owner
+        # ------------------------------------------------------------------
+        if control and cmds.objExists(control):
+            if cmds.attributeQuery(MSG_ATTR_SETTINGS, node=control, exists=True):
+                try:
+                    cmds.deleteAttr(f"{control}.{MSG_ATTR_SETTINGS}")
+                    _debug_log(f"delete_pivot_rig: removed {MSG_ATTR_SETTINGS} from '{control}'")
+                except RuntimeError:
+                    pass  # may be locked / referenced
 
         return True, f"Deleted pivot rig for '{control}'."
     finally:
@@ -1224,6 +1748,14 @@ def _build_ui(parent_layout: str) -> None:
     idempotent — safe to call from both show() and the uiScript
     callback without producing duplicates.
     """
+    # Kill stale UI scriptJobs BEFORE deleting any UI elements.
+    _kill_ui_script_jobs()
+
+    # Invalidate the global UI registry so any in-flight deferred
+    # callbacks see an empty dict and bail out.
+    global _ui_script_jobs
+    _ui.clear()
+
     # Clear existing children to prevent duplicate UI.  This handles
     # the case where Maya's uiScript and show() both call _build_ui,
     # or when the workspace control is restored on restart.
@@ -1311,11 +1843,13 @@ def _build_ui(parent_layout: str) -> None:
         backgroundColor=UI_COLORS["off_state"],
         enable=False
     )
+    _ui["state_indicator"] = state_indicator
 
     selection_text = cmds.text(
         label="No control selected",
         align="left"
     )
+    _ui["selection_text"] = selection_text
 
     cmds.setParent("..")
     cmds.setParent("..")
@@ -1410,6 +1944,7 @@ def _build_ui(parent_layout: str) -> None:
         backgroundColor=UI_COLORS["success"],
         annotation=TOOLTIPS["toggle_btn"]
     )
+    _ui["toggle_btn"] = toggle_btn
 
     key_btn = cmds.button(
         label="Key Control",
@@ -1441,6 +1976,30 @@ def _build_ui(parent_layout: str) -> None:
 
     cmds.setParent("..")
 
+    adjust_row = cmds.rowLayout(
+        numberOfColumns=2,
+        adjustableColumn=1,
+        columnWidth2=(160, 160)
+    )
+
+    adjust_pivot_btn = cmds.button(
+        label="Adjust Pivot",
+        height=28,
+        backgroundColor=UI_COLORS["warning"],
+        annotation=TOOLTIPS["adjust_pivot_btn"]
+    )
+
+    apply_adjustment_btn = cmds.button(
+        label="Apply Adjustment",
+        height=28,
+        backgroundColor=UI_COLORS["success"],
+        annotation=TOOLTIPS["apply_adjustment_btn"]
+    )
+
+    cmds.setParent("..")
+
+    cmds.separator(height=4, style="none")
+
     delete_btn = cmds.button(
         label="Delete Pivot Rig",
         height=26,
@@ -1470,6 +2029,7 @@ def _build_ui(parent_layout: str) -> None:
         height=100,
         allowMultiSelection=False
     )
+    _ui["rig_list"] = rig_list
 
     list_btns = cmds.rowLayout(
         numberOfColumns=3,
@@ -1516,6 +2076,7 @@ def _build_ui(parent_layout: str) -> None:
         wordWrap=True,
         text="Ready. Select a control and click 'Create Pivot Locator'."
     )
+    _ui["log_field"] = log_field
 
     cmds.setParent("..")
 
@@ -1543,45 +2104,69 @@ def _build_ui(parent_layout: str) -> None:
     _skip_list_refresh = [False]
 
     def log_message(message: str, msg_type: str = "info") -> None:
-        prefix_map = {"warning": "[!] ", "error": "[X] ", "success": "[OK] ", "info": ""}
-        prefix = prefix_map.get(msg_type, "")
-        current = cmds.scrollField(log_field, query=True, text=True) or ""
-        new_text = f"{prefix}{message}"
-        if current and not current.startswith("Ready."):
-            new_text = f"{current}\n{new_text}"
-        cmds.scrollField(log_field, edit=True, text=new_text)
-        cmds.scrollField(log_field, edit=True, insertionPosition=len(new_text))
+        _log = _ui.get("log_field")
+        if not _log or not cmds.objExists(_log):
+            return
+        try:
+            prefix_map = {"warning": "[!] ", "error": "[X] ", "success": "[OK] ", "info": ""}
+            prefix = prefix_map.get(msg_type, "")
+            current = cmds.scrollField(_log, query=True, text=True) or ""
+            new_text = f"{prefix}{message}"
+            if current and not current.startswith("Ready."):
+                new_text = f"{current}\n{new_text}"
+            cmds.scrollField(_log, edit=True, text=new_text)
+            cmds.scrollField(_log, edit=True, insertionPosition=len(new_text))
+        except RuntimeError:
+            pass
 
     def refresh_rig_list(preserve_selection: bool = True) -> None:
         """Refresh the rig list, optionally preserving the current selection."""
+        _rlist = _ui.get("rig_list")
+        if not _rlist or not cmds.objExists(_rlist):
+            _debug_log("refresh_rig_list: rig_list control not found in _ui, skipping")
+            return
         # Skip refresh if triggered by our own list selection
         if _skip_list_refresh[0]:
             return
 
-        # Save current selection before clearing
-        selected_control = None
-        if preserve_selection:
-            selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
-            if selected_items:
-                # Extract control name (without status suffix)
-                selected_control = selected_items[0].split(" [")[0]
-
-        cmds.textScrollList(rig_list, edit=True, removeAll=True)
+        # --- Gather data (may raise, but we want to see those errors) ---
         rigs = get_all_pivot_rigs()
+        _debug_log(f"refresh_rig_list: found {len(rigs)} settings nodes: {rigs}")
+        entries: List[str] = []
         for settings in sorted(rigs):
-            nodes = get_rig_nodes(settings)
-            control = nodes["control"] or "?"
-            active = is_rig_active(settings)
-            status = " [ON]" if active else " [OFF]"
-            cmds.textScrollList(rig_list, edit=True, append=f"{control}{status}")
+            try:
+                nodes = get_rig_nodes(settings)
+                control = nodes["control"] or "?"
+                active = is_rig_active(settings)
+                status = " [ON]" if active else " [OFF]"
+                entries.append(f"{control}{status}")
+            except Exception as exc:
+                # Skip individual broken rigs rather than aborting the list
+                _debug_log(f"refresh_rig_list: error reading {settings}: {exc}")
+                entries.append(f"?{settings} [ERR]")
 
-        # Restore selection if we had one
-        if selected_control:
-            all_items = cmds.textScrollList(rig_list, query=True, allItems=True) or []
-            for item in all_items:
-                if item.startswith(selected_control + " ["):
-                    cmds.textScrollList(rig_list, edit=True, selectItem=item)
-                    break
+        _debug_log(f"refresh_rig_list: entries to display: {entries}")
+
+        # --- Update UI (guarded against stale controls) ---
+        try:
+            selected_control = None
+            if preserve_selection:
+                selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
+                if selected_items:
+                    selected_control = selected_items[0].split(" [")[0]
+
+            cmds.textScrollList(_rlist, edit=True, removeAll=True)
+            for entry in entries:
+                cmds.textScrollList(_rlist, edit=True, append=entry)
+
+            if selected_control:
+                all_items = cmds.textScrollList(_rlist, query=True, allItems=True) or []
+                for item in all_items:
+                    if item.startswith(selected_control + " ["):
+                        cmds.textScrollList(_rlist, edit=True, selectItem=item)
+                        break
+        except RuntimeError as exc:
+            _debug_log(f"refresh_rig_list: RuntimeError updating UI: {exc}")
 
     def _resolve_selection() -> List[str]:
         """
@@ -1598,118 +2183,145 @@ def _build_ui(parent_layout: str) -> None:
         return resolved
 
     def update_status() -> None:
+        # Resolve controls from the global registry — never from closures.
+        _sel_text = _ui.get("selection_text")
+        _state_btn = _ui.get("state_indicator")
+        if not _sel_text or not _state_btn:
+            return
+        if not cmds.objExists(_sel_text) or not cmds.objExists(_state_btn):
+            return
+
+        # --- Gather data (scene queries — errors should be visible) ---
         sel = _resolve_selection()
 
         selected_settings = None
         pending_pivot = None
 
         for item in sel:
-            # Use short name for suffix checks
-            short_name = item.split("|")[-1]
+            # --- TMP node: use robust resolution ---
+            if _is_tmp_node(item):
+                short_name = item.split("|")[-1]
+                # Check for pending pivot (Stage 1)
+                if short_name.endswith(NULL_GRP_1_SUFFIX):
+                    if cmds.attributeQuery("setupComplete", node=item, exists=True):
+                        if not cmds.getAttr(f"{item}.setupComplete"):
+                            pending_pivot = item
+                            break
+                # Find settings via robust helper
+                settings = _find_settings_for_node(item)
+                if settings and cmds.objExists(settings):
+                    selected_settings = settings
+                    break
+                # Last resort: resolve owner
+                owner = _resolve_owner(item)
+                if owner:
+                    rig = get_rig_for_control(owner)
+                    if rig:
+                        selected_settings = rig
+                        break
+                continue
 
-            # Check for null_grp_1 (pivot)
-            if NULL_GRP_1_SUFFIX in short_name:
-                # Check if it's pending or complete
-                if cmds.attributeQuery("setupComplete", node=item, exists=True):
-                    if cmds.getAttr(f"{item}.setupComplete"):
-                        # Complete - find settings
-                        prefix = short_name.replace(NULL_GRP_1_SUFFIX, "")
-                        possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                        if cmds.objExists(possible_settings):
-                            selected_settings = possible_settings
-                    else:
-                        pending_pivot = item
-                break
-            # Check for null_grp_2 (anchor)
-            if NULL_GRP_2_SUFFIX in short_name:
-                prefix = short_name.replace(NULL_GRP_2_SUFFIX, "")
-                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                if cmds.objExists(possible_settings):
-                    selected_settings = possible_settings
-                break
-            # Check for offset group
-            if OFFSET_GRP_SUFFIX in short_name:
-                prefix = short_name.replace(OFFSET_GRP_SUFFIX, "")
-                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                if cmds.objExists(possible_settings):
-                    selected_settings = possible_settings
-                break
-            # Check if control
+            # --- Normal control ---
             rig = get_rig_for_control(item)
             if rig:
                 selected_settings = rig
                 break
-            # Also try short name for rig lookup
             short = item.split("|")[-1]
-            rig = get_rig_for_control(short)
-            if rig:
-                selected_settings = rig
-                break
-            # Check for pending pivot
+            if short != item:
+                rig = get_rig_for_control(short)
+                if rig:
+                    selected_settings = rig
+                    break
             pending = get_pending_pivot_for_control(item)
+            if not pending and short != item:
+                pending = get_pending_pivot_for_control(short)
             if pending:
                 pending_pivot = pending
 
-        if selected_settings:
-            nodes = get_rig_nodes(selected_settings)
-            control = nodes["control"]
-            active = is_rig_active(selected_settings)
-            cmds.text(selection_text, edit=True, label=f"Control: {control}")
-            if active:
-                cmds.button(state_indicator, edit=True, label="ON", backgroundColor=UI_COLORS["success"])
+        # --- Update UI (guarded against stale controls) ---
+        try:
+            if selected_settings:
+                nodes = get_rig_nodes(selected_settings)
+                control = nodes["control"]
+                active = is_rig_active(selected_settings)
+                cmds.text(_sel_text, edit=True, label=f"Control: {control}")
+                if active:
+                    cmds.button(_state_btn, edit=True, label="ON", backgroundColor=UI_COLORS["success"])
+                else:
+                    cmds.button(_state_btn, edit=True, label="OFF", backgroundColor=UI_COLORS["stage1"])
+            elif pending_pivot:
+                short_pending = pending_pivot.split("|")[-1]
+                if cmds.attributeQuery("targetControl", node=pending_pivot, exists=True):
+                    control = cmds.getAttr(f"{pending_pivot}.targetControl")
+                    cmds.text(_sel_text, edit=True, label=f"Pending: {control}")
+                cmds.button(_state_btn, edit=True, label="STAGE1", backgroundColor=UI_COLORS["stage1"])
+            elif sel:
+                display_name = sel[0].split("|")[-1]
+                cmds.text(_sel_text, edit=True, label=f"Selected: {display_name}")
+                cmds.button(_state_btn, edit=True, label="READY", backgroundColor=UI_COLORS["off_state"])
             else:
-                cmds.button(state_indicator, edit=True, label="OFF", backgroundColor=UI_COLORS["stage1"])
-        elif pending_pivot:
-            short_pending = pending_pivot.split("|")[-1]
-            if cmds.attributeQuery("targetControl", node=pending_pivot, exists=True):
-                control = cmds.getAttr(f"{pending_pivot}.targetControl")
-                cmds.text(selection_text, edit=True, label=f"Pending: {control}")
-            cmds.button(state_indicator, edit=True, label="STAGE1", backgroundColor=UI_COLORS["stage1"])
-        elif sel:
-            display_name = sel[0].split("|")[-1]
-            cmds.text(selection_text, edit=True, label=f"Selected: {display_name}")
-            cmds.button(state_indicator, edit=True, label="READY", backgroundColor=UI_COLORS["off_state"])
-        else:
-            cmds.text(selection_text, edit=True, label="No control selected")
-            cmds.button(state_indicator, edit=True, label="READY", backgroundColor=UI_COLORS["off_state"])
+                cmds.text(_sel_text, edit=True, label="No control selected")
+                cmds.button(_state_btn, edit=True, label="READY", backgroundColor=UI_COLORS["off_state"])
+        except RuntimeError:
+            pass
 
     def get_current_context():
-        """Get current rig settings or pending pivot."""
+        """Get current rig settings or pending pivot.
+
+        Uses ``_resolve_owner`` / ``_find_settings_for_node`` so that
+        selecting *any* TMP rig node (pivot, anchor, offset, settings,
+        ring shape, locator shape, etc.) correctly resolves to the
+        owning control's rig — preventing "pivot-of-pivot" creation and
+        ensuring toggle/delete always targets the right rig.
+        """
         sel = _resolve_selection()
 
         for item in sel:
-            short_name = item.split("|")[-1]
+            # ----------------------------------------------------------
+            # 1. If this IS a TMP node, resolve via robust helpers
+            # ----------------------------------------------------------
+            if _is_tmp_node(item):
+                # Check for pending (Stage 1) pivot null first
+                short_name = item.split("|")[-1]
+                if short_name.endswith(NULL_GRP_1_SUFFIX):
+                    if cmds.attributeQuery("setupComplete", node=item, exists=True):
+                        if not cmds.getAttr(f"{item}.setupComplete"):
+                            _debug_log(f"get_current_context: pending pivot '{item}'")
+                            return ("pending", item)
 
-            if NULL_GRP_1_SUFFIX in short_name:
-                if cmds.attributeQuery("setupComplete", node=item, exists=True):
-                    if cmds.getAttr(f"{item}.setupComplete"):
-                        prefix = short_name.replace(NULL_GRP_1_SUFFIX, "")
-                        possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                        if cmds.objExists(possible_settings):
-                            return ("rig", possible_settings)
-                    else:
-                        return ("pending", item)
-            if NULL_GRP_2_SUFFIX in short_name:
-                prefix = short_name.replace(NULL_GRP_2_SUFFIX, "")
-                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                if cmds.objExists(possible_settings):
-                    return ("rig", possible_settings)
-            if OFFSET_GRP_SUFFIX in short_name:
-                prefix = short_name.replace(OFFSET_GRP_SUFFIX, "")
-                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                if cmds.objExists(possible_settings):
-                    return ("rig", possible_settings)
+                # Find the settings node for this TMP hierarchy
+                settings = _find_settings_for_node(item)
+                if settings and cmds.objExists(settings):
+                    _debug_log(f"get_current_context: TMP node '{item}' → settings '{settings}'")
+                    return ("rig", settings)
 
+                # Last resort: resolve owner and look up their rig
+                owner = _resolve_owner(item)
+                if owner:
+                    rig = get_rig_for_control(owner)
+                    if rig:
+                        _debug_log(f"get_current_context: owner '{owner}' → rig '{rig}'")
+                        return ("rig", rig)
+
+                _debug_log(f"get_current_context: TMP node '{item}' could not be resolved")
+                continue
+
+            # ----------------------------------------------------------
+            # 2. Normal control — look up rig or pending pivot
+            # ----------------------------------------------------------
             rig = get_rig_for_control(item)
             if rig:
                 return ("rig", rig)
             # Try short name
             short = item.split("|")[-1]
-            rig = get_rig_for_control(short)
-            if rig:
-                return ("rig", rig)
+            if short != item:
+                rig = get_rig_for_control(short)
+                if rig:
+                    return ("rig", rig)
 
             pending = get_pending_pivot_for_control(item)
+            if not pending and short != item:
+                pending = get_pending_pivot_for_control(short)
             if pending:
                 return ("pending", pending)
 
@@ -1722,10 +2334,22 @@ def _build_ui(parent_layout: str) -> None:
         cmds.refresh(force=True)
 
         sel = _resolve_selection()
-        controls = [s for s in sel if TOOL_PREFIX not in s.split("|")[-1]]
+
+        # Resolve selection: if any item is a TMP node, resolve to its owner
+        controls = []
+        for s in sel:
+            if _is_tmp_node(s):
+                owner = _resolve_owner(s)
+                if owner and not _is_tmp_node(owner):
+                    _debug_log(f"on_create_pivot: resolved TMP '{s}' → owner '{owner}'")
+                    controls.append(owner)
+                else:
+                    _debug_log(f"on_create_pivot: skipping unresolvable TMP node '{s}'")
+            else:
+                controls.append(s)
 
         if not controls:
-            log_message("Select a control first.", "warning")
+            log_message("Select a control first (not a TMP rig node).", "warning")
             return
 
         # Use short name for the control (strip DAG path)
@@ -1747,13 +2371,14 @@ def _build_ui(parent_layout: str) -> None:
 
         A single evalDeferred can be overtaken by SelectionChanged
         scriptJob callbacks.  Double-deferring ensures we run AFTER
-        those have settled.  Also activates the Rotate manipulator so
-        the animator can immediately start rotating.
+        those have settled.
+
+        Does NOT force a specific tool context so the user is free to
+        choose the Move or Rotate manipulator.
         """
         def _inner():
             if cmds.objExists(node_name):
                 cmds.select(node_name, replace=True)
-                cmds.setToolTo("RotateSuperContext")
         cmds.evalDeferred(lambda: cmds.evalDeferred(_inner))
 
     def on_complete_setup(*args):
@@ -1791,6 +2416,8 @@ def _build_ui(parent_layout: str) -> None:
 
         refresh_rig_list()
         update_status()
+        # Also defer a refresh so the list updates after DAG changes settle
+        cmds.evalDeferred(refresh_rig_list)
         # Ensure pivot is selected after ALL UI updates have settled
         if pivot_to_select and cmds.objExists(pivot_to_select):
             _deferred_select_pivot(pivot_to_select)
@@ -1801,10 +2428,12 @@ def _build_ui(parent_layout: str) -> None:
         if ctx_type == "rig":
             success, msg, is_active = toggle_pivot(ctx_node)
             log_message(msg, "success" if success else "error")
-            if is_active:
-                cmds.button(toggle_btn, edit=True, label="Toggle OFF", backgroundColor=UI_COLORS["success"])
-            else:
-                cmds.button(toggle_btn, edit=True, label="Toggle ON", backgroundColor=UI_COLORS["stage1"])
+            _tbtn = _ui.get("toggle_btn")
+            if _tbtn and cmds.objExists(_tbtn):
+                if is_active:
+                    cmds.button(_tbtn, edit=True, label="Toggle OFF", backgroundColor=UI_COLORS["success"])
+                else:
+                    cmds.button(_tbtn, edit=True, label="Toggle ON", backgroundColor=UI_COLORS["stage1"])
         elif ctx_type == "pending":
             log_message("Complete setup first before toggling.", "warning")
         else:
@@ -1812,6 +2441,7 @@ def _build_ui(parent_layout: str) -> None:
 
         refresh_rig_list()
         update_status()
+        cmds.evalDeferred(refresh_rig_list)
 
     def on_key(*args):
         ctx_type, ctx_node = get_current_context()
@@ -1820,6 +2450,28 @@ def _build_ui(parent_layout: str) -> None:
             log_message(msg, "success" if success else "error")
         else:
             log_message("No active pivot rig found.", "warning")
+
+    def on_adjust_pivot(*args):
+        ctx_type, ctx_node = get_current_context()
+        if ctx_type == "rig":
+            success, msg = adjust_pivot(ctx_node)
+            log_message(msg, "success" if success else "error")
+            refresh_rig_list()
+            update_status()
+        elif ctx_type == "pending":
+            log_message("Rig is still in Stage 1. Move the pivot directly, then Complete Setup.", "warning")
+        else:
+            log_message("No pivot rig found. Create one first.", "warning")
+
+    def on_apply_adjustment(*args):
+        ctx_type, ctx_node = get_current_context()
+        if ctx_type == "rig":
+            success, msg = apply_pivot_adjustment(ctx_node)
+            log_message(msg, "success" if success else "error")
+            refresh_rig_list()
+            update_status()
+        else:
+            log_message("No pivot rig found to apply adjustment to.", "warning")
 
     def on_delete(*args):
         ctx_type, ctx_node = get_current_context()
@@ -1867,7 +2519,10 @@ def _build_ui(parent_layout: str) -> None:
 
     def on_list_select(*args):
         """Handle selection in the rig list - select the pivot in viewport."""
-        selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
+        _rlist = _ui.get("rig_list")
+        if not _rlist or not cmds.objExists(_rlist):
+            return
+        selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
         if selected_items:
             control_name = selected_items[0].split(" [")[0]
             settings = get_rig_for_control(control_name)
@@ -1885,7 +2540,10 @@ def _build_ui(parent_layout: str) -> None:
         update_status()
 
     def on_list_toggle(*args):
-        selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
+        _rlist = _ui.get("rig_list")
+        if not _rlist or not cmds.objExists(_rlist):
+            return
+        selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
         if not selected_items:
             log_message("Select a rig from the list.", "warning")
             return
@@ -1899,7 +2557,10 @@ def _build_ui(parent_layout: str) -> None:
 
     def on_list_delete(*args):
         """Delete the rig selected in the list."""
-        selected_items = cmds.textScrollList(rig_list, query=True, selectItem=True) or []
+        _rlist = _ui.get("rig_list")
+        if not _rlist or not cmds.objExists(_rlist):
+            return
+        selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
         if not selected_items:
             log_message("Select a rig from the list to delete.", "warning")
             return
@@ -1913,6 +2574,8 @@ def _build_ui(parent_layout: str) -> None:
 
     def on_close(*args):
         """Close the tool window / workspace control."""
+        _kill_ui_script_jobs()
+        _ui.clear()
         if (hasattr(cmds, "workspaceControl")
                 and cmds.workspaceControl(WORKSPACE_CONTROL_NAME, exists=True)):
             cmds.deleteUI(WORKSPACE_CONTROL_NAME)
@@ -1925,6 +2588,8 @@ def _build_ui(parent_layout: str) -> None:
     cmds.button(complete_setup_btn, edit=True, command=on_complete_setup)
     cmds.button(toggle_btn, edit=True, command=on_toggle)
     cmds.button(key_btn, edit=True, command=on_key)
+    cmds.button(adjust_pivot_btn, edit=True, command=on_adjust_pivot)
+    cmds.button(apply_adjustment_btn, edit=True, command=on_apply_adjustment)
     cmds.button(delete_btn, edit=True, command=on_delete)
     cmds.button(select_pivot_btn, edit=True, command=on_select_pivot)
     cmds.button(select_control_btn, edit=True, command=on_select_control)
@@ -1936,26 +2601,36 @@ def _build_ui(parent_layout: str) -> None:
     cmds.textScrollList(rig_list, edit=True, selectCommand=on_list_select)
     cmds.textScrollList(rig_list, edit=True, doubleClickCommand=on_list_toggle)
 
-    # Parent scriptJobs to the top-level UI element so they are
-    # automatically killed when the panel / window is closed.
-    # For workspaceControl, use the workspace control name directly.
-    # For a plain window, use the window name.
-    if (hasattr(cmds, "workspaceControl")
-            and cmds.workspaceControl(WORKSPACE_CONTROL_NAME, exists=True)):
-        script_parent = WORKSPACE_CONTROL_NAME
-    elif cmds.window(WINDOW_NAME, exists=True):
-        script_parent = WINDOW_NAME
-    else:
-        # Fallback — parent to the layout itself (may not auto-kill)
-        script_parent = parent_layout
+    # Parent scriptJobs to main_scroll so they are automatically killed
+    # when _build_ui() deletes existing children at the top of the function.
+    # This is reimport-safe: even if the Python module is reloaded (which
+    # resets _ui_script_jobs to []), the old scriptJobs die when their
+    # parent UI element (main_scroll) is deleted by the rebuild.
+    script_parent = main_scroll
 
-    cmds.scriptJob(event=["SelectionChanged", update_status], parent=script_parent)
-    cmds.scriptJob(event=["SelectionChanged", refresh_rig_list], parent=script_parent)
+    _ui_script_jobs.append(
+        cmds.scriptJob(event=["SelectionChanged", update_status], parent=script_parent)
+    )
+    _ui_script_jobs.append(
+        cmds.scriptJob(event=["SelectionChanged", refresh_rig_list], parent=script_parent)
+    )
+    # Keep the rig list current when scenes are opened / created.
+    _ui_script_jobs.append(
+        cmds.scriptJob(event=["SceneOpened", refresh_rig_list], parent=script_parent)
+    )
+    _ui_script_jobs.append(
+        cmds.scriptJob(event=["NewSceneOpened", refresh_rig_list], parent=script_parent)
+    )
 
-    # Initialize
-
+    # Initialize — also double-defer so the list refreshes after the
+    # workspace control is fully realized (handles uiScript rebuild
+    # timing).  The immediate calls handle the common case; the deferred
+    # calls handle workspaceControl restoration where the UI may not be
+    # fully laid out until the next idle cycle.
     refresh_rig_list()
     update_status()
+    cmds.evalDeferred(refresh_rig_list, lowestPriority=True)
+    cmds.evalDeferred(update_status, lowestPriority=True)
 
 
 def _rebuild_workspace_ui() -> None:
@@ -1989,6 +2664,11 @@ def show() -> None:
     use_workspace = hasattr(cmds, "workspaceControl")
 
     if use_workspace:
+        # Kill scriptJobs and invalidate UI registry BEFORE deleting the
+        # workspace control so no stale callback can fire mid-teardown.
+        _kill_ui_script_jobs()
+        _ui.clear()
+
         # Always delete and recreate so the UI is fully rebuilt.
         # This guarantees the Close button (and everything else) is
         # present whether the panel is floating or docked.
@@ -2033,6 +2713,8 @@ def show() -> None:
     # ------------------------------------------------------------------
     # Fallback: plain floating window (Maya < 2017)
     # ------------------------------------------------------------------
+    _kill_ui_script_jobs()
+    _ui.clear()
     if cmds.window(WINDOW_NAME, exists=True):
         cmds.deleteUI(WINDOW_NAME)
 
