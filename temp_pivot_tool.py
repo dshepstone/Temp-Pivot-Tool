@@ -1105,20 +1105,11 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         _setup_undo_guard()
         setup_auto_key(settings_node)
 
-        # Select null_grp_1 with the Rotate manipulator so the user can
-        # start orbiting immediately.  Double-deferred ensures it sticks
-        # after all UI refreshes and SelectionChanged scriptJobs settle.
+        # Select null_grp_1 so the user sees it in the viewport.
+        # Do NOT force a tool context here — the UI callback
+        # (_deferred_select_pivot) handles the final selection and lets
+        # the user keep whichever manipulator they prefer (Rotate or Move).
         cmds.select(null_grp_1)
-        cmds.setToolTo("RotateSuperContext")
-        _deferred_node = null_grp_1  # capture for lambda
-        cmds.evalDeferred(
-            lambda n=_deferred_node: cmds.evalDeferred(
-                lambda: (
-                    cmds.select(n, replace=True),
-                    cmds.setToolTo("RotateSuperContext"),
-                ) if cmds.objExists(n) else None
-            )
-        )
 
         return True, f"Setup complete! Rotate pivot null to orbit '{control}' around custom pivot. Auto-key enabled.", settings_node
     finally:
@@ -1846,7 +1837,6 @@ def _build_ui(parent_layout: str) -> None:
     )
 
     state_indicator = cmds.button(
-        "TMP_state_indicator",
         label="READY",
         width=60,
         height=28,
@@ -1856,7 +1846,6 @@ def _build_ui(parent_layout: str) -> None:
     _ui["state_indicator"] = state_indicator
 
     selection_text = cmds.text(
-        "TMP_selection_text",
         label="No control selected",
         align="left"
     )
@@ -1950,7 +1939,6 @@ def _build_ui(parent_layout: str) -> None:
     cmds.columnLayout(adjustableColumn=True, rowSpacing=4)
 
     toggle_btn = cmds.button(
-        "TMP_toggle_btn",
         label="Toggle ON / OFF",
         height=36,
         backgroundColor=UI_COLORS["success"],
@@ -2038,7 +2026,6 @@ def _build_ui(parent_layout: str) -> None:
     cmds.columnLayout(adjustableColumn=True, rowSpacing=4)
 
     rig_list = cmds.textScrollList(
-        "TMP_rig_list",
         height=100,
         allowMultiSelection=False
     )
@@ -2084,7 +2071,6 @@ def _build_ui(parent_layout: str) -> None:
     )
 
     log_field = cmds.scrollField(
-        "TMP_log_field",
         height=80,
         editable=False,
         wordWrap=True,
@@ -2137,6 +2123,7 @@ def _build_ui(parent_layout: str) -> None:
         """Refresh the rig list, optionally preserving the current selection."""
         _rlist = _ui.get("rig_list")
         if not _rlist or not cmds.objExists(_rlist):
+            _debug_log("refresh_rig_list: rig_list control not found in _ui, skipping")
             return
         # Skip refresh if triggered by our own list selection
         if _skip_list_refresh[0]:
@@ -2144,6 +2131,7 @@ def _build_ui(parent_layout: str) -> None:
 
         # --- Gather data (may raise, but we want to see those errors) ---
         rigs = get_all_pivot_rigs()
+        _debug_log(f"refresh_rig_list: found {len(rigs)} settings nodes: {rigs}")
         entries: List[str] = []
         for settings in sorted(rigs):
             try:
@@ -2152,9 +2140,12 @@ def _build_ui(parent_layout: str) -> None:
                 active = is_rig_active(settings)
                 status = " [ON]" if active else " [OFF]"
                 entries.append(f"{control}{status}")
-            except Exception:
+            except Exception as exc:
                 # Skip individual broken rigs rather than aborting the list
+                _debug_log(f"refresh_rig_list: error reading {settings}: {exc}")
                 entries.append(f"?{settings} [ERR]")
+
+        _debug_log(f"refresh_rig_list: entries to display: {entries}")
 
         # --- Update UI (guarded against stale controls) ---
         try:
@@ -2174,8 +2165,8 @@ def _build_ui(parent_layout: str) -> None:
                     if item.startswith(selected_control + " ["):
                         cmds.textScrollList(_rlist, edit=True, selectItem=item)
                         break
-        except RuntimeError:
-            pass
+        except RuntimeError as exc:
+            _debug_log(f"refresh_rig_list: RuntimeError updating UI: {exc}")
 
     def _resolve_selection() -> List[str]:
         """
@@ -2380,13 +2371,14 @@ def _build_ui(parent_layout: str) -> None:
 
         A single evalDeferred can be overtaken by SelectionChanged
         scriptJob callbacks.  Double-deferring ensures we run AFTER
-        those have settled.  Also activates the Rotate manipulator so
-        the animator can immediately start rotating.
+        those have settled.
+
+        Does NOT force a specific tool context so the user is free to
+        choose the Move or Rotate manipulator.
         """
         def _inner():
             if cmds.objExists(node_name):
                 cmds.select(node_name, replace=True)
-                cmds.setToolTo("RotateSuperContext")
         cmds.evalDeferred(lambda: cmds.evalDeferred(_inner))
 
     def on_complete_setup(*args):
@@ -2424,6 +2416,8 @@ def _build_ui(parent_layout: str) -> None:
 
         refresh_rig_list()
         update_status()
+        # Also defer a refresh so the list updates after DAG changes settle
+        cmds.evalDeferred(refresh_rig_list)
         # Ensure pivot is selected after ALL UI updates have settled
         if pivot_to_select and cmds.objExists(pivot_to_select):
             _deferred_select_pivot(pivot_to_select)
@@ -2447,6 +2441,7 @@ def _build_ui(parent_layout: str) -> None:
 
         refresh_rig_list()
         update_status()
+        cmds.evalDeferred(refresh_rig_list)
 
     def on_key(*args):
         ctx_type, ctx_node = get_current_context()
@@ -2627,12 +2622,15 @@ def _build_ui(parent_layout: str) -> None:
         cmds.scriptJob(event=["NewSceneOpened", refresh_rig_list], parent=script_parent)
     )
 
-    # Initialize — also defer so the list refreshes after the workspace
-    # control is fully realized (handles uiScript rebuild timing).
+    # Initialize — also double-defer so the list refreshes after the
+    # workspace control is fully realized (handles uiScript rebuild
+    # timing).  The immediate calls handle the common case; the deferred
+    # calls handle workspaceControl restoration where the UI may not be
+    # fully laid out until the next idle cycle.
     refresh_rig_list()
     update_status()
-    cmds.evalDeferred(refresh_rig_list)
-    cmds.evalDeferred(update_status)
+    cmds.evalDeferred(refresh_rig_list, lowestPriority=True)
+    cmds.evalDeferred(update_status, lowestPriority=True)
 
 
 def _rebuild_workspace_ui() -> None:
