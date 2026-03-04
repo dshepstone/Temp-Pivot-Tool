@@ -454,8 +454,34 @@ def get_pending_pivot_for_control(control: str) -> Optional[str]:
     return None
 
 
+def _resolve_stored_name(name: Optional[str]) -> Optional[str]:
+    """Resolve a stored node name that may have become a stale DAG path.
+
+    If *name* is a full DAG path that no longer exists but the short
+    (leaf) name does exist uniquely, return the short name so the rest
+    of the code can still find it.
+    """
+    if not name:
+        return None
+    if cmds.objExists(name):
+        return name
+    # Try the short (leaf) name
+    short = name.split("|")[-1]
+    matches = cmds.ls(short, long=True) or []
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        # Ambiguous — return first match (better than None)
+        return matches[0]
+    return None
+
+
 def get_rig_nodes(settings_node: str) -> Dict[str, Optional[str]]:
-    """Get all rig node names from a settings node."""
+    """Get all rig node names from a settings node.
+
+    Stored names are resolved through ``_resolve_stored_name`` so that
+    DAG-path changes caused by reparenting do not break look-ups.
+    """
     result = {
         "settings": settings_node,
         "null_grp_1": None,  # Pivot (animator-facing control)
@@ -469,15 +495,25 @@ def get_rig_nodes(settings_node: str) -> Dict[str, Optional[str]]:
         return result
 
     if cmds.attributeQuery("nullGrp1", node=settings_node, exists=True):
-        result["null_grp_1"] = cmds.getAttr(f"{settings_node}.nullGrp1") or None
+        result["null_grp_1"] = _resolve_stored_name(
+            cmds.getAttr(f"{settings_node}.nullGrp1") or None
+        )
     if cmds.attributeQuery("nullGrp2", node=settings_node, exists=True):
-        result["null_grp_2"] = cmds.getAttr(f"{settings_node}.nullGrp2") or None
+        result["null_grp_2"] = _resolve_stored_name(
+            cmds.getAttr(f"{settings_node}.nullGrp2") or None
+        )
     if cmds.attributeQuery("pivotOffsetGrp", node=settings_node, exists=True):
-        result["pivot_offset_grp"] = cmds.getAttr(f"{settings_node}.pivotOffsetGrp") or None
+        result["pivot_offset_grp"] = _resolve_stored_name(
+            cmds.getAttr(f"{settings_node}.pivotOffsetGrp") or None
+        )
     if cmds.attributeQuery("targetControl", node=settings_node, exists=True):
-        result["control"] = cmds.getAttr(f"{settings_node}.targetControl") or None
+        result["control"] = _resolve_stored_name(
+            cmds.getAttr(f"{settings_node}.targetControl") or None
+        )
     if cmds.attributeQuery("constraintName", node=settings_node, exists=True):
-        result["constraint"] = cmds.getAttr(f"{settings_node}.constraintName") or None
+        result["constraint"] = _resolve_stored_name(
+            cmds.getAttr(f"{settings_node}.constraintName") or None
+        )
 
     return result
 
@@ -656,7 +692,16 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         cmds.xform(offset_grp, ws=True, ro=null_rot)
 
         # 5. Re-parent null_grp_1 under the offset group
+        #    IMPORTANT: After parenting, the DAG path changes.  Re-query by
+        #    listing children of offset_grp to get the new valid name.
         cmds.parent(null_grp_1, offset_grp)
+        # Re-resolve null_grp_1's name after reparenting (DAG path changed)
+        children = cmds.listRelatives(offset_grp, children=True, type="transform", fullPath=True) or []
+        for child in children:
+            short = child.split("|")[-1]
+            if NULL_GRP_1_SUFFIX in short:
+                null_grp_1 = child
+                break
 
         # 6. Zero out null_grp_1's local transforms and pivots
         #    The offset is now stored in pivotOffsetGrp's position
@@ -685,16 +730,21 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         settings_node = cmds.createNode("transform", name=f"{prefix}{SETTINGS_SUFFIX}")
         cmds.setAttr(f"{settings_node}.visibility", 0)
 
-        # Store references
+        # Store references — use SHORT names (no pipe prefix) so they remain
+        # valid after future reparenting operations (toggle on/off).
+        null_grp_1_short = null_grp_1.split("|")[-1]
+        offset_grp_short = offset_grp.split("|")[-1]
         _add_string_attr(settings_node, "targetControl", control)
-        _add_string_attr(settings_node, "nullGrp1", null_grp_1)
+        _add_string_attr(settings_node, "nullGrp1", null_grp_1_short)
         _add_string_attr(settings_node, "nullGrp2", "")  # Created on first toggle OFF
-        _add_string_attr(settings_node, "pivotOffsetGrp", offset_grp)
+        _add_string_attr(settings_node, "pivotOffsetGrp", offset_grp_short)
         _add_string_attr(settings_node, "constraintName", constraint)
         _add_bool_attr(settings_node, "isActive", True)
 
         # Parent settings under offset_grp for organization
         cmds.parent(settings_node, offset_grp)
+        # Re-resolve settings_node after reparenting (DAG path changed)
+        settings_node = _resolve_stored_name(settings_node.split("|")[-1])
 
         # Mark null_grp_1 setup as complete
         cmds.setAttr(f"{null_grp_1}.setupComplete", True)
@@ -769,6 +819,9 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
             current_parent = cmds.listRelatives(offset_grp, parent=True)
             if not current_parent or current_parent[0] != null_grp_2:
                 cmds.parent(offset_grp, null_grp_2)
+            # Re-resolve names after reparenting (DAG paths changed)
+            offset_grp = _resolve_stored_name(offset_grp.split("|")[-1])
+            null_grp_1 = _resolve_stored_name(null_grp_1.split("|")[-1])
 
             # Reset null_grp_1 local transforms (offset is in the offset group)
             for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
@@ -778,6 +831,8 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
             current_parent = cmds.listRelatives(null_grp_1, parent=True)
             if not current_parent or current_parent[0] != null_grp_2:
                 cmds.parent(null_grp_1, null_grp_2)
+            # Re-resolve after reparenting
+            null_grp_1 = _resolve_stored_name(null_grp_1.split("|")[-1])
 
             for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
                 _safe_set_attr(null_grp_1, attr, 0)
@@ -910,11 +965,16 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
             current_parent = cmds.listRelatives(offset_grp, parent=True)
             if not current_parent or current_parent[0] != null_grp_2:
                 cmds.parent(offset_grp, null_grp_2)
+            # Re-resolve names after reparenting (DAG paths changed)
+            offset_grp = _resolve_stored_name(offset_grp.split("|")[-1])
+            null_grp_1 = _resolve_stored_name(null_grp_1.split("|")[-1])
         else:
             # v6 compatibility: parent null_grp_1 directly under null_grp_2
             current_parent = cmds.listRelatives(null_grp_1, parent=True)
             if not current_parent or current_parent[0] != null_grp_2:
                 cmds.parent(null_grp_1, null_grp_2)
+            # Re-resolve after reparenting
+            null_grp_1 = _resolve_stored_name(null_grp_1.split("|")[-1])
 
         # =====================================================================
         # Reset null_group_1 local transforms
@@ -1798,15 +1858,18 @@ def _build_ui(parent_layout: str) -> None:
     cmds.textScrollList(rig_list, edit=True, selectCommand=on_list_select)
     cmds.textScrollList(rig_list, edit=True, doubleClickCommand=on_list_toggle)
 
-    # Use the top-level parent for scriptJob parenting (works with both window and workspaceControl)
-    # Find the top-level window or workspace control
-    script_parent = parent_layout
-    # Walk up the UI hierarchy to find the top-level element
-    while True:
-        p = cmds.setParent(script_parent, query=True)
-        if not p or p == script_parent:
-            break
-        script_parent = p
+    # Parent scriptJobs to the top-level UI element so they are
+    # automatically killed when the panel / window is closed.
+    # For workspaceControl, use the workspace control name directly.
+    # For a plain window, use the window name.
+    if (hasattr(cmds, "workspaceControl")
+            and cmds.workspaceControl(WORKSPACE_CONTROL_NAME, exists=True)):
+        script_parent = WORKSPACE_CONTROL_NAME
+    elif cmds.window(WINDOW_NAME, exists=True):
+        script_parent = WINDOW_NAME
+    else:
+        # Fallback — parent to the layout itself (may not auto-kill)
+        script_parent = parent_layout
 
     cmds.scriptJob(event=["SelectionChanged", update_status], parent=script_parent)
     cmds.scriptJob(event=["SelectionChanged", refresh_rig_list], parent=script_parent)
@@ -1821,8 +1884,13 @@ def show() -> None:
     """
     Show the Temp Pivot Tool.
 
-    Attempts to create a dockable workspaceControl (Maya 2017+).
-    Falls back to a regular floating window if workspaceControl is unavailable.
+    Uses workspaceControl (Maya 2017+) so the tool can be docked, but
+    launches as a **floating window** on first open.  If the user has
+    previously docked it, re-running the script will restore and focus
+    the existing panel instead of creating a duplicate.
+
+    Falls back to a regular floating window if workspaceControl is
+    unavailable (Maya < 2017).
     """
     # Install the undo guard
     _setup_undo_guard()
@@ -1833,15 +1901,22 @@ def show() -> None:
     use_workspace = hasattr(cmds, "workspaceControl")
 
     if use_workspace:
-        # If the workspace control already exists, close and recreate
+        # If the workspace control already exists, just make it visible
+        # and raise it — do not recreate (preserves user's dock position).
         if cmds.workspaceControl(WORKSPACE_CONTROL_NAME, exists=True):
-            cmds.deleteUI(WORKSPACE_CONTROL_NAME)
+            cmds.workspaceControl(
+                WORKSPACE_CONTROL_NAME, edit=True,
+                visible=True, restore=True
+            )
+            return
 
         # Also clean up any leftover window with the old name
         if cmds.window(WINDOW_NAME, exists=True):
             cmds.deleteUI(WINDOW_NAME)
 
-        # Create the workspace control
+        # Create the workspace control — starts **floating** (not docked).
+        # The user can dock it manually if desired; Maya remembers the
+        # position on subsequent launches thanks to retain=True.
         cmds.workspaceControl(
             WORKSPACE_CONTROL_NAME,
             label=WINDOW_TITLE,
@@ -1850,18 +1925,20 @@ def show() -> None:
             initialWidth=340,
             initialHeight=620,
             minimumWidth=300,
-            dockToMainWindow=("right", False),
         )
 
         # Build the UI inside the workspace control
         _build_ui(WORKSPACE_CONTROL_NAME)
 
         # Raise / show
-        cmds.workspaceControl(WORKSPACE_CONTROL_NAME, edit=True, visible=True, restore=True)
+        cmds.workspaceControl(
+            WORKSPACE_CONTROL_NAME, edit=True,
+            visible=True,
+        )
         return
 
     # ------------------------------------------------------------------
-    # Fallback: plain floating window
+    # Fallback: plain floating window (Maya < 2017)
     # ------------------------------------------------------------------
     if cmds.window(WINDOW_NAME, exists=True):
         cmds.deleteUI(WINDOW_NAME)
