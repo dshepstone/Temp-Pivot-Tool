@@ -764,13 +764,13 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         setup_auto_key(settings_node)
 
         # Select null_grp_1 so user can start animating immediately.
-        # Use evalDeferred to ensure the selection sticks after all UI
-        # refreshes and scriptJob callbacks have settled.
+        # Use double-deferred to ensure the selection sticks after all
+        # UI refreshes and SelectionChanged scriptJobs have settled.
         cmds.select(null_grp_1)
         _deferred_node = null_grp_1  # capture for lambda
         cmds.evalDeferred(
-            lambda n=_deferred_node: (
-                cmds.select(n, replace=True) if cmds.objExists(n) else None
+            lambda n=_deferred_node: cmds.evalDeferred(
+                lambda: cmds.select(n, replace=True) if cmds.objExists(n) else None
             )
         )
 
@@ -1725,6 +1725,18 @@ def _build_ui(parent_layout: str) -> None:
         cmds.evalDeferred(refresh_rig_list)
         cmds.evalDeferred(update_status)
 
+    def _deferred_select_pivot(node_name: str) -> None:
+        """Select the pivot null via double-deferred to survive UI refreshes.
+
+        A single evalDeferred can be overtaken by SelectionChanged
+        scriptJob callbacks.  Double-deferring ensures we run AFTER
+        those have settled.
+        """
+        def _inner():
+            if cmds.objExists(node_name):
+                cmds.select(node_name, replace=True)
+        cmds.evalDeferred(lambda: cmds.evalDeferred(_inner))
+
     def on_complete_setup(*args):
         ctx_type, ctx_node = get_current_context()
         pivot_to_select = None
@@ -1740,6 +1752,7 @@ def _build_ui(parent_layout: str) -> None:
         else:
             # Try to find pending pivot for selected control
             sel = _resolve_selection()
+            found = False
             for item in sel:
                 short = item.split("|")[-1]
                 pending = get_pending_pivot_for_control(item)
@@ -1751,20 +1764,17 @@ def _build_ui(parent_layout: str) -> None:
                     if success and settings:
                         nodes = get_rig_nodes(settings)
                         pivot_to_select = nodes["null_grp_1"]
-                    refresh_rig_list()
-                    update_status()
-                    # Ensure pivot is selected after UI updates
-                    if pivot_to_select and cmds.objExists(pivot_to_select):
-                        cmds.evalDeferred(lambda loc=pivot_to_select: cmds.select(loc))
-                    return
+                    found = True
+                    break
 
-            log_message("No pending pivot null found. Create one first.", "warning")
+            if not found:
+                log_message("No pending pivot null found. Create one first.", "warning")
 
         refresh_rig_list()
         update_status()
-        # Ensure pivot is selected after UI updates
+        # Ensure pivot is selected after ALL UI updates have settled
         if pivot_to_select and cmds.objExists(pivot_to_select):
-            cmds.evalDeferred(lambda loc=pivot_to_select: cmds.select(loc))
+            _deferred_select_pivot(pivot_to_select)
 
     def on_toggle(*args):
         ctx_type, ctx_node = get_current_context()
