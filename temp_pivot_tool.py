@@ -2142,25 +2142,32 @@ def _build_ui(parent_layout: str) -> None:
         if _skip_list_refresh[0]:
             return
 
-        try:
-            # Save current selection before clearing
-            selected_control = None
-            if preserve_selection:
-                selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
-                if selected_items:
-                    # Extract control name (without status suffix)
-                    selected_control = selected_items[0].split(" [")[0]
-
-            cmds.textScrollList(_rlist, edit=True, removeAll=True)
-            rigs = get_all_pivot_rigs()
-            for settings in sorted(rigs):
+        # --- Gather data (may raise, but we want to see those errors) ---
+        rigs = get_all_pivot_rigs()
+        entries: List[str] = []
+        for settings in sorted(rigs):
+            try:
                 nodes = get_rig_nodes(settings)
                 control = nodes["control"] or "?"
                 active = is_rig_active(settings)
                 status = " [ON]" if active else " [OFF]"
-                cmds.textScrollList(_rlist, edit=True, append=f"{control}{status}")
+                entries.append(f"{control}{status}")
+            except Exception:
+                # Skip individual broken rigs rather than aborting the list
+                entries.append(f"?{settings} [ERR]")
 
-            # Restore selection if we had one
+        # --- Update UI (guarded against stale controls) ---
+        try:
+            selected_control = None
+            if preserve_selection:
+                selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
+                if selected_items:
+                    selected_control = selected_items[0].split(" [")[0]
+
+            cmds.textScrollList(_rlist, edit=True, removeAll=True)
+            for entry in entries:
+                cmds.textScrollList(_rlist, edit=True, append=entry)
+
             if selected_control:
                 all_items = cmds.textScrollList(_rlist, query=True, allItems=True) or []
                 for item in all_items:
@@ -2193,53 +2200,55 @@ def _build_ui(parent_layout: str) -> None:
         if not cmds.objExists(_sel_text) or not cmds.objExists(_state_btn):
             return
 
-        try:
-            sel = _resolve_selection()
+        # --- Gather data (scene queries — errors should be visible) ---
+        sel = _resolve_selection()
 
-            selected_settings = None
-            pending_pivot = None
+        selected_settings = None
+        pending_pivot = None
 
-            for item in sel:
-                # --- TMP node: use robust resolution ---
-                if _is_tmp_node(item):
-                    short_name = item.split("|")[-1]
-                    # Check for pending pivot (Stage 1)
-                    if short_name.endswith(NULL_GRP_1_SUFFIX):
-                        if cmds.attributeQuery("setupComplete", node=item, exists=True):
-                            if not cmds.getAttr(f"{item}.setupComplete"):
-                                pending_pivot = item
-                                break
-                    # Find settings via robust helper
-                    settings = _find_settings_for_node(item)
-                    if settings and cmds.objExists(settings):
-                        selected_settings = settings
-                        break
-                    # Last resort: resolve owner
-                    owner = _resolve_owner(item)
-                    if owner:
-                        rig = get_rig_for_control(owner)
-                        if rig:
-                            selected_settings = rig
+        for item in sel:
+            # --- TMP node: use robust resolution ---
+            if _is_tmp_node(item):
+                short_name = item.split("|")[-1]
+                # Check for pending pivot (Stage 1)
+                if short_name.endswith(NULL_GRP_1_SUFFIX):
+                    if cmds.attributeQuery("setupComplete", node=item, exists=True):
+                        if not cmds.getAttr(f"{item}.setupComplete"):
+                            pending_pivot = item
                             break
-                    continue
-
-                # --- Normal control ---
-                rig = get_rig_for_control(item)
-                if rig:
-                    selected_settings = rig
+                # Find settings via robust helper
+                settings = _find_settings_for_node(item)
+                if settings and cmds.objExists(settings):
+                    selected_settings = settings
                     break
-                short = item.split("|")[-1]
-                if short != item:
-                    rig = get_rig_for_control(short)
+                # Last resort: resolve owner
+                owner = _resolve_owner(item)
+                if owner:
+                    rig = get_rig_for_control(owner)
                     if rig:
                         selected_settings = rig
                         break
-                pending = get_pending_pivot_for_control(item)
-                if not pending and short != item:
-                    pending = get_pending_pivot_for_control(short)
-                if pending:
-                    pending_pivot = pending
+                continue
 
+            # --- Normal control ---
+            rig = get_rig_for_control(item)
+            if rig:
+                selected_settings = rig
+                break
+            short = item.split("|")[-1]
+            if short != item:
+                rig = get_rig_for_control(short)
+                if rig:
+                    selected_settings = rig
+                    break
+            pending = get_pending_pivot_for_control(item)
+            if not pending and short != item:
+                pending = get_pending_pivot_for_control(short)
+            if pending:
+                pending_pivot = pending
+
+        # --- Update UI (guarded against stale controls) ---
+        try:
             if selected_settings:
                 nodes = get_rig_nodes(selected_settings)
                 control = nodes["control"]
@@ -2610,11 +2619,20 @@ def _build_ui(parent_layout: str) -> None:
     _ui_script_jobs.append(
         cmds.scriptJob(event=["SelectionChanged", refresh_rig_list], parent=script_parent)
     )
+    # Keep the rig list current when scenes are opened / created.
+    _ui_script_jobs.append(
+        cmds.scriptJob(event=["SceneOpened", refresh_rig_list], parent=script_parent)
+    )
+    _ui_script_jobs.append(
+        cmds.scriptJob(event=["NewSceneOpened", refresh_rig_list], parent=script_parent)
+    )
 
-    # Initialize
-
+    # Initialize — also defer so the list refreshes after the workspace
+    # control is fully realized (handles uiScript rebuild timing).
     refresh_rig_list()
     update_status()
+    cmds.evalDeferred(refresh_rig_list)
+    cmds.evalDeferred(update_status)
 
 
 def _rebuild_workspace_ui() -> None:
