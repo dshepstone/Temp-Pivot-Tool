@@ -2089,6 +2089,9 @@ def _build_ui(parent_layout: str) -> None:
 
     def refresh_rig_list(preserve_selection: bool = True) -> None:
         """Refresh the rig list, optionally preserving the current selection."""
+        # Guard: bail out if the UI element no longer exists (stale scriptJob).
+        if not cmds.objExists(rig_list):
+            return
         # Skip refresh if triggered by our own list selection
         if _skip_list_refresh[0]:
             return
@@ -2133,6 +2136,9 @@ def _build_ui(parent_layout: str) -> None:
         return resolved
 
     def update_status() -> None:
+        # Guard: bail out if the UI element no longer exists (stale scriptJob).
+        if not cmds.objExists(selection_text):
+            return
         sel = _resolve_selection()
 
         selected_settings = None
