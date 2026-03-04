@@ -703,12 +703,17 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
                 null_grp_1 = child
                 break
 
-        # 6. Zero out null_grp_1's local transforms, scale, and pivots
+        # 6. Zero out null_grp_1's local transforms and pivots
         #    The offset is now stored in pivotOffsetGrp's position
         for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
             _safe_set_attr(null_grp_1, attr, 0)
+
+        # Hide scale channels — they are not used by the pivot control
+        # and hiding them keeps the Channel Box clean for the animator.
         for attr in ["sx", "sy", "sz"]:
-            _safe_set_attr(null_grp_1, attr, 1)
+            attr_path = f"{null_grp_1}.{attr}"
+            if cmds.objExists(attr_path) and not cmds.getAttr(attr_path, lock=True):
+                cmds.setAttr(attr_path, keyable=False, channelBox=False)
 
         # Zero the pivots - this is the key freeze operation
         cmds.xform(null_grp_1, objectSpace=True, pivots=[0, 0, 0])
@@ -1924,6 +1929,17 @@ def _build_ui(parent_layout: str) -> None:
     update_status()
 
 
+def _rebuild_workspace_ui() -> None:
+    """Rebuild the tool UI inside an existing workspaceControl.
+
+    Called by Maya's ``uiScript`` mechanism whenever the workspace
+    control is restored (e.g. after Maya restart or re-dock).  Also
+    called directly by :func:`show` on first creation.
+    """
+    _setup_undo_guard()
+    _build_ui(WORKSPACE_CONTROL_NAME)
+
+
 def show() -> None:
     """
     Show the Temp Pivot Tool.
@@ -1945,14 +1961,11 @@ def show() -> None:
     use_workspace = hasattr(cmds, "workspaceControl")
 
     if use_workspace:
-        # If the workspace control already exists, just make it visible
-        # and raise it — do not recreate (preserves user's dock position).
+        # Always delete and recreate so the UI is fully rebuilt.
+        # This guarantees the Close button (and everything else) is
+        # present whether the panel is floating or docked.
         if cmds.workspaceControl(WORKSPACE_CONTROL_NAME, exists=True):
-            cmds.workspaceControl(
-                WORKSPACE_CONTROL_NAME, edit=True,
-                visible=True, restore=True
-            )
-            return
+            cmds.deleteUI(WORKSPACE_CONTROL_NAME)
 
         # Also clean up any leftover window with the old name
         if cmds.window(WINDOW_NAME, exists=True):
@@ -1961,6 +1974,11 @@ def show() -> None:
         # Create the workspace control — starts **floating** (not docked).
         # The user can dock it manually if desired; Maya remembers the
         # position on subsequent launches thanks to retain=True.
+        #
+        # uiScript is the command Maya calls to rebuild the UI contents
+        # whenever the retained workspace control is restored (e.g.
+        # after a Maya restart).  Without this, a retained workspace
+        # control comes back as an empty shell with no buttons.
         cmds.workspaceControl(
             WORKSPACE_CONTROL_NAME,
             label=WINDOW_TITLE,
@@ -1969,6 +1987,7 @@ def show() -> None:
             initialWidth=340,
             initialHeight=620,
             minimumWidth=300,
+            uiScript="import temp_pivot_tool; temp_pivot_tool._rebuild_workspace_ui()",
         )
 
         # Build the UI inside the workspace control
