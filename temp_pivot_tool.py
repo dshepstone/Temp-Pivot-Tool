@@ -120,11 +120,26 @@ def _kill_ui_script_jobs() -> None:
     _ui_script_jobs = []
 
 
+def _ui_control_exists(ctrl_path: str) -> bool:
+    """Return True if *ctrl_path* refers to an existing Maya UI control.
+
+    ``cmds.objExists`` is designed for DG/DAG nodes, not UI elements, and
+    may return ``False`` for valid UI control paths depending on Maya
+    version.  ``cmds.control(exists=True)`` is the reliable UI check.
+    """
+    if not ctrl_path:
+        return False
+    try:
+        return cmds.control(ctrl_path, exists=True)
+    except RuntimeError:
+        return False
+
+
 def _ui_exists(*keys: str) -> bool:
     """Return True only if every *key* is in ``_ui`` and its control exists."""
     for k in keys:
         ctrl = _ui.get(k)
-        if not ctrl or not cmds.objExists(ctrl):
+        if not ctrl or not _ui_control_exists(ctrl):
             return False
     return True
 
@@ -723,8 +738,19 @@ def _enter_pivot_adjust_mode(node: str) -> None:
 # -----------------------------
 
 def get_all_pivot_rigs() -> List[str]:
-    """Find all temp pivot rigs in the scene by finding settings nodes."""
-    settings_nodes = cmds.ls(f"*{SETTINGS_SUFFIX}", type="transform") or []
+    """Find all temp pivot rigs in the scene by finding settings nodes.
+
+    Uses ``cmds.ls(type="transform")`` and filters by short-name suffix
+    rather than relying on a glob pattern, because the ``*`` wildcard in
+    ``cmds.ls`` does not match the DAG path separator ``|``.  When settings
+    nodes are parented under the rig hierarchy (e.g. under pivotOffsetGrp
+    or null_grp_2), a simple ``*_TMP_settings`` pattern fails to find them.
+    """
+    all_transforms = cmds.ls(type="transform") or []
+    settings_nodes = [
+        n for n in all_transforms
+        if n.split("|")[-1].endswith(SETTINGS_SUFFIX)
+    ]
     return settings_nodes
 
 
@@ -950,9 +976,10 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     6. Create settings node
 
     The resulting hierarchy:
-        pivotOffsetGrp (at world position of the pivot point)
-            └ null_group_1 (zeroed pivots, clean channels)
-                └ [parentConstraint] → control
+        null_group_2 (POSITION ANCHOR - aligned to control)
+            └ pivotOffsetGrp (at world position of the pivot point)
+                └ null_group_1 (zeroed pivots, clean channels)
+                    └ [parentConstraint] → control
 
     Args:
         null_grp_1: The pivot null from Stage 1
@@ -1001,24 +1028,23 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         # 2. Read null_grp_1's current world matrix (its position at control)
         null_grp_1_world_matrix = cmds.xform(null_grp_1, q=True, ws=True, m=True)
 
-        # 3. Create the pivotOffsetGrp
+        # ---- Phase A: Build offset_grp → null_grp_1 at WORLD level ----
+        # This matches the original working hierarchy.  offset_grp is
+        # positioned at the pivot point with the control's rotation, and
+        # null_grp_1 is parented under it with zeroed transforms/pivots.
+
+        # 3. Create the pivotOffsetGrp at the world-space pivot point
         offset_grp = cmds.group(
             empty=True,
             name=f"{prefix}{OFFSET_GRP_SUFFIX}"
         )
-
-        # 4. Position pivotOffsetGrp at the world-space pivot point
-        #    This group sits at the exact location where the user placed the pivot
         cmds.xform(offset_grp, ws=True, t=pivot_ws)
-
-        # Copy the rotation from null_grp_1 so the offset group is oriented
-        # to match the control's rotation (same as null_grp_1's initial orientation)
+        # Match the control's rotation so the local-space offset axes
+        # align with the control's orientation.
         null_rot = cmds.xform(null_grp_1, q=True, ws=True, ro=True)
         cmds.xform(offset_grp, ws=True, ro=null_rot)
 
-        # 5. Re-parent null_grp_1 under the offset group
-        #    IMPORTANT: After parenting, the DAG path changes.  Re-query by
-        #    listing children of offset_grp to get the new valid name.
+        # 4. Parent null_grp_1 under offset_grp
         cmds.parent(null_grp_1, offset_grp)
         # Re-resolve null_grp_1's name after reparenting (DAG path changed)
         children = cmds.listRelatives(offset_grp, children=True, type="transform", fullPath=True) or []
@@ -1028,8 +1054,39 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
                 null_grp_1 = child
                 break
 
-        # 6. Zero out null_grp_1's local transforms and pivots
-        #    The offset is now stored in pivotOffsetGrp's position
+        # 5. Zero null_grp_1's local transforms and pivots
+        for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
+            _safe_set_attr(null_grp_1, attr, 0)
+
+        # ---- Phase B: Add null_grp_2 anchor (same as toggle_off) ----
+        # This is the EXACT sequence that toggle_off uses to wrap the
+        # existing offset_grp hierarchy under a position anchor.  By
+        # replicating toggle_off's order of operations, we guarantee the
+        # local transforms that Maya computes during cmds.parent() are
+        # identical to what toggle_on later expects.
+
+        # 6. Create null_grp_2 (POSITION ANCHOR) aligned to control
+        null_grp_2 = _create_visual_null(
+            f"{prefix}{NULL_GRP_2_SUFFIX}",
+            UI_COLORS["stage2"],  # Blue for anchor
+            size=1.2  # Slightly larger to distinguish
+        )
+        _align_translate_rotate(null_grp_2, control)
+        cmds.xform(null_grp_2, ws=False, s=[1, 1, 1])
+        _set_shapes_visibility(null_grp_2, False)
+
+        # 7. Parent offset_grp under null_grp_2 — Maya preserves
+        #    offset_grp's world position and computes the correct local
+        #    transforms in one atomic operation (same as toggle_off).
+        cmds.parent(offset_grp, null_grp_2)
+        offset_grp = _resolve_stored_name(offset_grp.split("|")[-1])
+        null_grp_1 = _resolve_stored_name(null_grp_1.split("|")[-1])
+
+        # ---- Phase C: Activate (same as toggle_on) ----
+        # Re-zero null_grp_1 local transforms after reparenting, then
+        # create the constraint — exactly matching toggle_on's logic.
+
+        # 8. Zero null_grp_1 local transforms (toggle_on step)
         for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
             _safe_set_attr(null_grp_1, attr, 0)
 
@@ -1065,10 +1122,11 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         # Store references — use SHORT names (no pipe prefix) so they remain
         # valid after future reparenting operations (toggle on/off).
         null_grp_1_short = null_grp_1.split("|")[-1]
+        null_grp_2_short = null_grp_2.split("|")[-1]
         offset_grp_short = offset_grp.split("|")[-1]
         _add_string_attr(settings_node, "targetControl", control)
         _add_string_attr(settings_node, "nullGrp1", null_grp_1_short)
-        _add_string_attr(settings_node, "nullGrp2", "")  # Created on first toggle OFF
+        _add_string_attr(settings_node, "nullGrp2", null_grp_2_short)
         _add_string_attr(settings_node, "pivotOffsetGrp", offset_grp_short)
         _add_string_attr(settings_node, "constraintName", constraint)
         _add_bool_attr(settings_node, "isActive", True)
@@ -2105,7 +2163,7 @@ def _build_ui(parent_layout: str) -> None:
 
     def log_message(message: str, msg_type: str = "info") -> None:
         _log = _ui.get("log_field")
-        if not _log or not cmds.objExists(_log):
+        if not _log or not _ui_control_exists(_log):
             return
         try:
             prefix_map = {"warning": "[!] ", "error": "[X] ", "success": "[OK] ", "info": ""}
@@ -2122,7 +2180,7 @@ def _build_ui(parent_layout: str) -> None:
     def refresh_rig_list(preserve_selection: bool = True) -> None:
         """Refresh the rig list, optionally preserving the current selection."""
         _rlist = _ui.get("rig_list")
-        if not _rlist or not cmds.objExists(_rlist):
+        if not _rlist or not _ui_control_exists(_rlist):
             _debug_log("refresh_rig_list: rig_list control not found in _ui, skipping")
             return
         # Skip refresh if triggered by our own list selection
@@ -2188,7 +2246,7 @@ def _build_ui(parent_layout: str) -> None:
         _state_btn = _ui.get("state_indicator")
         if not _sel_text or not _state_btn:
             return
-        if not cmds.objExists(_sel_text) or not cmds.objExists(_state_btn):
+        if not _ui_control_exists(_sel_text) or not _ui_control_exists(_state_btn):
             return
 
         # --- Gather data (scene queries — errors should be visible) ---
@@ -2520,7 +2578,7 @@ def _build_ui(parent_layout: str) -> None:
     def on_list_select(*args):
         """Handle selection in the rig list - select the pivot in viewport."""
         _rlist = _ui.get("rig_list")
-        if not _rlist or not cmds.objExists(_rlist):
+        if not _rlist or not _ui_control_exists(_rlist):
             return
         selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
         if selected_items:
@@ -2541,7 +2599,7 @@ def _build_ui(parent_layout: str) -> None:
 
     def on_list_toggle(*args):
         _rlist = _ui.get("rig_list")
-        if not _rlist or not cmds.objExists(_rlist):
+        if not _rlist or not _ui_control_exists(_rlist):
             return
         selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
         if not selected_items:
@@ -2558,7 +2616,7 @@ def _build_ui(parent_layout: str) -> None:
     def on_list_delete(*args):
         """Delete the rig selected in the list."""
         _rlist = _ui.get("rig_list")
-        if not _rlist or not cmds.objExists(_rlist):
+        if not _rlist or not _ui_control_exists(_rlist):
             return
         selected_items = cmds.textScrollList(_rlist, query=True, selectItem=True) or []
         if not selected_items:
