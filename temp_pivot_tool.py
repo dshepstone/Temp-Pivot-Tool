@@ -763,14 +763,18 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         _setup_undo_guard()
         setup_auto_key(settings_node)
 
-        # Select null_grp_1 so user can start animating immediately.
-        # Use double-deferred to ensure the selection sticks after all
-        # UI refreshes and SelectionChanged scriptJobs have settled.
+        # Select null_grp_1 with the Rotate manipulator so the user can
+        # start orbiting immediately.  Double-deferred ensures it sticks
+        # after all UI refreshes and SelectionChanged scriptJobs settle.
         cmds.select(null_grp_1)
+        cmds.setToolTo("RotateSuperContext")
         _deferred_node = null_grp_1  # capture for lambda
         cmds.evalDeferred(
             lambda n=_deferred_node: cmds.evalDeferred(
-                lambda: cmds.select(n, replace=True) if cmds.objExists(n) else None
+                lambda: (
+                    cmds.select(n, replace=True),
+                    cmds.setToolTo("RotateSuperContext"),
+                ) if cmds.objExists(n) else None
             )
         )
 
@@ -1730,11 +1734,13 @@ def _build_ui(parent_layout: str) -> None:
 
         A single evalDeferred can be overtaken by SelectionChanged
         scriptJob callbacks.  Double-deferring ensures we run AFTER
-        those have settled.
+        those have settled.  Also activates the Rotate manipulator so
+        the animator can immediately start rotating.
         """
         def _inner():
             if cmds.objExists(node_name):
                 cmds.select(node_name, replace=True)
+                cmds.setToolTo("RotateSuperContext")
         cmds.evalDeferred(lambda: cmds.evalDeferred(_inner))
 
     def on_complete_setup(*args):
