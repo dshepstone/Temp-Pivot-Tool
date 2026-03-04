@@ -723,8 +723,28 @@ def _enter_pivot_adjust_mode(node: str) -> None:
 # -----------------------------
 
 def get_all_pivot_rigs() -> List[str]:
-    """Find all temp pivot rigs in the scene by finding settings nodes."""
-    settings_nodes = cmds.ls(f"*{SETTINGS_SUFFIX}", type="transform") or []
+    """Find all temp pivot rigs in the scene by finding settings nodes.
+
+    ``cmds.ls("*suffix")`` can miss nodes when long DAG paths change due to
+    reparenting, so we filter transform nodes by short name and expected
+    settings attributes.
+    """
+    all_transforms = cmds.ls(type="transform", long=True) or []
+    settings_nodes: List[str] = []
+
+    for node in all_transforms:
+        short = node.split("|")[-1]
+        if not short.endswith(SETTINGS_SUFFIX):
+            continue
+
+        # Guard against unrelated transforms that happen to match the suffix.
+        if not cmds.attributeQuery("targetControl", node=node, exists=True):
+            continue
+        if not cmds.attributeQuery("nullGrp1", node=node, exists=True):
+            continue
+
+        settings_nodes.append(node)
+
     return settings_nodes
 
 
@@ -950,9 +970,10 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
     6. Create settings node
 
     The resulting hierarchy:
-        pivotOffsetGrp (at world position of the pivot point)
-            └ null_group_1 (zeroed pivots, clean channels)
-                └ [parentConstraint] → control
+        null_group_2 (position anchor, aligned to control)
+            └ pivotOffsetGrp (at world position of the pivot point)
+                └ null_group_1 (zeroed pivots, clean channels)
+                    └ [parentConstraint] → control
 
     Args:
         null_grp_1: The pivot null from Stage 1
@@ -1001,13 +1022,22 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         # 2. Read null_grp_1's current world matrix (its position at control)
         null_grp_1_world_matrix = cmds.xform(null_grp_1, q=True, ws=True, m=True)
 
-        # 3. Create the pivotOffsetGrp
+        # 3. Create null_group_2 (anchor) so Stage 2 matches toggle_on hierarchy
+        null_grp_2 = _create_visual_null(
+            f"{prefix}{NULL_GRP_2_SUFFIX}",
+            UI_COLORS["stage2"],
+            size=1.2
+        )
+        _align_translate_rotate(null_grp_2, control)
+        cmds.xform(null_grp_2, ws=False, s=[1, 1, 1])
+
+        # 4. Create the pivotOffsetGrp
         offset_grp = cmds.group(
             empty=True,
             name=f"{prefix}{OFFSET_GRP_SUFFIX}"
         )
 
-        # 4. Position pivotOffsetGrp at the world-space pivot point
+        # 5. Position pivotOffsetGrp at the world-space pivot point
         #    This group sits at the exact location where the user placed the pivot
         cmds.xform(offset_grp, ws=True, t=pivot_ws)
 
@@ -1016,7 +1046,11 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         null_rot = cmds.xform(null_grp_1, q=True, ws=True, ro=True)
         cmds.xform(offset_grp, ws=True, ro=null_rot)
 
-        # 5. Re-parent null_grp_1 under the offset group
+        # Parent offset_grp under the anchor first so translation space is stable
+        cmds.parent(offset_grp, null_grp_2)
+        offset_grp = _resolve_stored_name(offset_grp.split("|")[-1]) or offset_grp
+
+        # 6. Re-parent null_grp_1 under the offset group
         #    IMPORTANT: After parenting, the DAG path changes.  Re-query by
         #    listing children of offset_grp to get the new valid name.
         cmds.parent(null_grp_1, offset_grp)
@@ -1028,7 +1062,7 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
                 null_grp_1 = child
                 break
 
-        # 6. Zero out null_grp_1's local transforms and pivots
+        # 7. Zero out null_grp_1's local transforms and pivots
         #    The offset is now stored in pivotOffsetGrp's position
         for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
             _safe_set_attr(null_grp_1, attr, 0)
@@ -1068,7 +1102,7 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         offset_grp_short = offset_grp.split("|")[-1]
         _add_string_attr(settings_node, "targetControl", control)
         _add_string_attr(settings_node, "nullGrp1", null_grp_1_short)
-        _add_string_attr(settings_node, "nullGrp2", "")  # Created on first toggle OFF
+        _add_string_attr(settings_node, "nullGrp2", null_grp_2.split("|")[-1])
         _add_string_attr(settings_node, "pivotOffsetGrp", offset_grp_short)
         _add_string_attr(settings_node, "constraintName", constraint)
         _add_bool_attr(settings_node, "isActive", True)
@@ -1097,6 +1131,10 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
 
         # Mark null_grp_1 setup as complete
         cmds.setAttr(f"{null_grp_1}.setupComplete", True)
+
+        # Keep anchor hidden while active (same state as toggle_on behavior)
+        cmds.setAttr(f"{null_grp_2}.visibility", 1)
+        _set_shapes_visibility(null_grp_2, False)
 
         # Update null_grp_1 color to indicate active (green)
         _set_null_color(null_grp_1, UI_COLORS["success"])
