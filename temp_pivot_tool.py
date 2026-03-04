@@ -1219,8 +1219,21 @@ def _build_ui(parent_layout: str) -> None:
 
     This is separated from show() so the same UI can be placed inside
     either a workspaceControl or a plain window.
+
+    Any existing children are removed first so the function is
+    idempotent — safe to call from both show() and the uiScript
+    callback without producing duplicates.
     """
+    # Clear existing children to prevent duplicate UI.  This handles
+    # the case where Maya's uiScript and show() both call _build_ui,
+    # or when the workspace control is restored on restart.
     cmds.setParent(parent_layout)
+    existing = cmds.layout(parent_layout, query=True, childArray=True) or []
+    for child in existing:
+        try:
+            cmds.deleteUI(child)
+        except RuntimeError:
+            pass
 
     main_scroll = cmds.scrollLayout(
         childResizable=True,
@@ -1950,17 +1963,8 @@ def _rebuild_workspace_ui() -> None:
 
     Called by Maya's ``uiScript`` mechanism whenever the workspace
     control is restored (e.g. after Maya restart or re-dock).
-
-    Clears any existing children first to prevent duplicate UI when
-    Maya fires ``uiScript`` while :func:`show` also builds the UI.
     """
     _setup_undo_guard()
-    # Remove any existing child layouts to prevent duplication
-    existing = cmds.workspaceControl(
-        WORKSPACE_CONTROL_NAME, query=True, childArray=True
-    ) or []
-    for child in existing:
-        cmds.deleteUI(child)
     _build_ui(WORKSPACE_CONTROL_NAME)
 
 
@@ -2014,9 +2018,10 @@ def show() -> None:
             uiScript="import temp_pivot_tool; temp_pivot_tool._rebuild_workspace_ui()",
         )
 
-        # uiScript fires automatically and builds the UI via
-        # _rebuild_workspace_ui.  No manual _build_ui call here —
-        # that would create a duplicate.
+        # Build the UI inside the workspace control.  _build_ui()
+        # clears existing children first, so even if Maya's uiScript
+        # already fired we won't get duplicates.
+        _build_ui(WORKSPACE_CONTROL_NAME)
 
         # Raise / show
         cmds.workspaceControl(
