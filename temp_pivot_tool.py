@@ -470,6 +470,20 @@ def _align_to_target_world_matrix(object_to_align: str, target: str) -> None:
     )
 
 
+def _align_translate_rotate(source: str, target: str) -> None:
+    """
+    Align *source* to *target*'s world-space position and rotation only.
+
+    Unlike ``_align_to_target_world_matrix``, this does **not** copy scale,
+    avoiding scale-compensation issues when children are reparented under
+    the aligned node.
+    """
+    pos = cmds.xform(target, q=True, ws=True, t=True)
+    rot = cmds.xform(target, q=True, ws=True, ro=True)
+    cmds.xform(source, ws=True, t=pos)
+    cmds.xform(source, ws=True, ro=rot)
+
+
 def _match_translation_world(source: str, target: str) -> None:
     """Match only world-space translation using xform."""
     pos = cmds.xform(target, q=True, ws=True, t=True)
@@ -1123,9 +1137,12 @@ def toggle_on(settings_node: str) -> Tuple[bool, str]:
     cmds.undoInfo(openChunk=True, chunkName="TMP_ToggleOn")
     try:
         # =====================================================================
-        # Realign null_group_2 to control's current world position/rotation
+        # Realign null_group_2 to control's current world position/rotation.
+        # Use position+rotation only (no scale) to avoid scale-compensation
+        # issues when children are reparented under null_grp_2.
         # =====================================================================
-        _align_to_target_world_matrix(null_grp_2, control)
+        _align_translate_rotate(null_grp_2, control)
+        cmds.xform(null_grp_2, ws=False, s=[1, 1, 1])
 
         # =====================================================================
         # Handle v7 (with offset group) or v6 (without) hierarchy
@@ -1271,9 +1288,12 @@ def toggle_off(settings_node: str) -> Tuple[bool, str]:
             cmds.setAttr(f"{settings_node}.nullGrp2", null_grp_2, type="string")
 
         # =====================================================================
-        # Align null_group_2 to control's current world position/rotation
+        # Align null_group_2 to control's current world position/rotation.
+        # Use position+rotation only (no scale) to avoid scale-compensation
+        # issues when children are reparented under null_grp_2.
         # =====================================================================
-        _align_to_target_world_matrix(null_grp_2, control)
+        _align_translate_rotate(null_grp_2, control)
+        cmds.xform(null_grp_2, ws=False, s=[1, 1, 1])
 
         # =====================================================================
         # Parent hierarchy under null_group_2
@@ -2501,18 +2521,12 @@ def _build_ui(parent_layout: str) -> None:
     cmds.textScrollList(rig_list, edit=True, selectCommand=on_list_select)
     cmds.textScrollList(rig_list, edit=True, doubleClickCommand=on_list_toggle)
 
-    # Parent scriptJobs to the top-level UI element so they are
-    # automatically killed when the panel / window is closed.
-    # For workspaceControl, use the workspace control name directly.
-    # For a plain window, use the window name.
-    if (hasattr(cmds, "workspaceControl")
-            and cmds.workspaceControl(WORKSPACE_CONTROL_NAME, exists=True)):
-        script_parent = WORKSPACE_CONTROL_NAME
-    elif cmds.window(WINDOW_NAME, exists=True):
-        script_parent = WINDOW_NAME
-    else:
-        # Fallback — parent to the layout itself (may not auto-kill)
-        script_parent = parent_layout
+    # Parent scriptJobs to main_scroll so they are automatically killed
+    # when _build_ui() deletes existing children at the top of the function.
+    # This is reimport-safe: even if the Python module is reloaded (which
+    # resets _ui_script_jobs to []), the old scriptJobs die when their
+    # parent UI element (main_scroll) is deleted by the rebuild.
+    script_parent = main_scroll
 
     _ui_script_jobs.append(
         cmds.scriptJob(event=["SelectionChanged", update_status], parent=script_parent)
