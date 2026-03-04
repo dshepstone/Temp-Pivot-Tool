@@ -703,10 +703,12 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
                 null_grp_1 = child
                 break
 
-        # 6. Zero out null_grp_1's local transforms and pivots
+        # 6. Zero out null_grp_1's local transforms, scale, and pivots
         #    The offset is now stored in pivotOffsetGrp's position
         for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
             _safe_set_attr(null_grp_1, attr, 0)
+        for attr in ["sx", "sy", "sz"]:
+            _safe_set_attr(null_grp_1, attr, 1)
 
         # Zero the pivots - this is the key freeze operation
         cmds.xform(null_grp_1, objectSpace=True, pivots=[0, 0, 0])
@@ -756,8 +758,16 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         _setup_undo_guard()
         setup_auto_key(settings_node)
 
-        # Select null_grp_1 so user can start using it
+        # Select null_grp_1 so user can start animating immediately.
+        # Use evalDeferred to ensure the selection sticks after all UI
+        # refreshes and scriptJob callbacks have settled.
         cmds.select(null_grp_1)
+        _deferred_node = null_grp_1  # capture for lambda
+        cmds.evalDeferred(
+            lambda n=_deferred_node: (
+                cmds.select(n, replace=True) if cmds.objExists(n) else None
+            )
+        )
 
         return True, f"Setup complete! Rotate pivot null to orbit '{control}' around custom pivot. Auto-key enabled.", settings_node
     finally:
@@ -1052,7 +1062,13 @@ def key_control(settings_node: str) -> Tuple[bool, str]:
 # =============================================================================
 
 def _create_auto_key_callback(settings_node: str):
-    """Create a callback function for auto-keying that captures the settings node."""
+    """Create a callback function for auto-keying that captures the settings node.
+
+    Undo is suppressed (``stateWithoutFlush=False``) so that the
+    setKeyframe call does NOT create a separate undo entry.  This lets
+    the user undo a single rotation in one step instead of having to
+    undo twice (once for the key, once for the rotation).
+    """
     def auto_key_callback():
         # Guard: skip if we are in an undo/redo operation
         global _is_undoing
@@ -1061,7 +1077,13 @@ def _create_auto_key_callback(settings_node: str):
 
         # Only key if the rig is still active
         if cmds.objExists(settings_node) and is_rig_active(settings_node):
-            key_control(settings_node)
+            # Suppress undo so the keyframe merges with the user's
+            # manipulation command rather than creating a second entry.
+            cmds.undoInfo(stateWithoutFlush=False)
+            try:
+                key_control(settings_node)
+            finally:
+                cmds.undoInfo(stateWithoutFlush=True)
     return auto_key_callback
 
 
@@ -1475,7 +1497,20 @@ def _build_ui(parent_layout: str) -> None:
 
     cmds.setParent("..")
 
-    cmds.separator(height=16, style="none")
+    cmds.separator(height=8, style="none")
+
+    # ==========================================
+    # CLOSE TOOL
+    # ==========================================
+
+    close_btn = cmds.button(
+        label="Close Tool",
+        height=28,
+        backgroundColor=(0.5, 0.5, 0.5),
+        annotation="Close the Temp Pivot Tool window."
+    )
+
+    cmds.separator(height=8, style="none")
 
     # ==========================================
     # CALLBACKS
@@ -1842,6 +1877,14 @@ def _build_ui(parent_layout: str) -> None:
             refresh_rig_list(preserve_selection=False)
             update_status()
 
+    def on_close(*args):
+        """Close the tool window / workspace control."""
+        if (hasattr(cmds, "workspaceControl")
+                and cmds.workspaceControl(WORKSPACE_CONTROL_NAME, exists=True)):
+            cmds.deleteUI(WORKSPACE_CONTROL_NAME)
+        elif cmds.window(WINDOW_NAME, exists=True):
+            cmds.deleteUI(WINDOW_NAME)
+
     # Connect callbacks
 
     cmds.button(create_pivot_btn, edit=True, command=on_create_pivot)
@@ -1854,6 +1897,7 @@ def _build_ui(parent_layout: str) -> None:
     cmds.button(toggle_list_btn, edit=True, command=on_list_toggle)
     cmds.button(delete_list_btn, edit=True, command=on_list_delete)
     cmds.button(refresh_btn, edit=True, command=lambda *_: refresh_rig_list())
+    cmds.button(close_btn, edit=True, command=on_close)
 
     cmds.textScrollList(rig_list, edit=True, selectCommand=on_list_select)
     cmds.textScrollList(rig_list, edit=True, doubleClickCommand=on_list_toggle)
