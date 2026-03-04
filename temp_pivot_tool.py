@@ -87,6 +87,9 @@ _ALL_TMP_SUFFIXES = [
 # Auto-key scriptJob storage (keyed by settings node name)
 _auto_key_jobs: Dict[str, List[int]] = {}
 
+# UI scriptJob IDs — killed and recreated on each _build_ui() call
+_ui_script_jobs: List[int] = []
+
 # Undo guard - prevents auto-key from firing during undo/redo
 _is_undoing: bool = False
 _undo_guard_jobs: List[int] = []
@@ -151,6 +154,13 @@ TOOLTIPS = {
     "select_control_btn": (
         "Select the original control.\n"
         "Useful for keying or checking values."
+    ),
+    "adjust_pivot_btn": (
+        "Adjust the pivot position on an existing rig.\n\n"
+        "1. Toggles OFF (if active) so the control is free\n"
+        "2. Makes the rig visible and selects the pivot offset\n"
+        "3. Move it to a new position with the Move tool\n"
+        "4. Click 'Toggle ON' to reactivate with the new pivot"
     ),
 }
 
@@ -1304,6 +1314,83 @@ def toggle_pivot(settings_node: str) -> Tuple[bool, str, bool]:
 
 
 # =============================================================================
+# ADJUST PIVOT POSITION
+# =============================================================================
+
+def adjust_pivot(settings_node: str) -> Tuple[bool, str]:
+    """Enter pivot-adjustment mode on an existing rig.
+
+    Allows the user to reposition the pivot offset group without having
+    to delete and recreate the rig.
+
+    Process:
+    1. Toggle OFF if active (deletes constraint so control is free).
+    2. Make the pivot rig hierarchy visible.
+    3. Select the pivotOffsetGrp and activate the Move tool so the
+       user can drag it to a new position.
+    4. When satisfied, the user clicks **Toggle ON** to reactivate.
+
+    Args:
+        settings_node: The settings node for this rig.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    if not cmds.objExists(settings_node):
+        return False, "Settings node not found."
+
+    nodes = get_rig_nodes(settings_node)
+    control = nodes["control"]
+    offset_grp = nodes["pivot_offset_grp"]
+    null_grp_1 = nodes["null_grp_1"]
+    null_grp_2 = nodes["null_grp_2"]
+
+    if not control or not cmds.objExists(control):
+        return False, f"Control '{control}' not found."
+    if not offset_grp or not cmds.objExists(offset_grp):
+        return False, "Offset group not found. Cannot adjust pivot."
+
+    cmds.undoInfo(openChunk=True, chunkName="TMP_AdjustPivot")
+    try:
+        # 1. Toggle off if active
+        if is_rig_active(settings_node):
+            toggle_off(settings_node)
+            # Re-resolve names after toggle_off (DAG paths may change)
+            nodes = get_rig_nodes(settings_node)
+            offset_grp = nodes["pivot_offset_grp"]
+            null_grp_1 = nodes["null_grp_1"]
+            null_grp_2 = nodes["null_grp_2"]
+            if not offset_grp or not cmds.objExists(offset_grp):
+                return False, "Offset group lost after toggle off."
+
+        # 2. Make the rig visible so the user can see the pivot
+        if null_grp_2 and cmds.objExists(null_grp_2):
+            cmds.setAttr(f"{null_grp_2}.visibility", 1)
+        if offset_grp and cmds.objExists(offset_grp):
+            cmds.setAttr(f"{offset_grp}.visibility", 1)
+
+        # Color the pivot null orange to indicate adjustment mode
+        if null_grp_1 and cmds.objExists(null_grp_1):
+            _set_null_color(null_grp_1, UI_COLORS["warning"])
+
+        # 3. Select the offset group and activate Move tool
+        cmds.select(offset_grp, replace=True)
+        cmds.setToolTo("moveSuperContext")
+
+        _debug_log(
+            f"adjust_pivot: entered adjust mode for '{control}', "
+            f"selected '{offset_grp}'"
+        )
+
+        return True, (
+            f"Adjust mode for '{control}'. "
+            "Move the pivot null to a new position, then click 'Toggle ON' to reactivate."
+        )
+    finally:
+        cmds.undoInfo(closeChunk=True)
+
+
+# =============================================================================
 # KEY CONTROL
 # =============================================================================
 
@@ -1519,6 +1606,15 @@ def _build_ui(parent_layout: str) -> None:
     idempotent — safe to call from both show() and the uiScript
     callback without producing duplicates.
     """
+    # Kill stale UI scriptJobs from a previous _build_ui() call.
+    # These reference UI elements that are about to be deleted below,
+    # so they must be killed first to prevent "Object not found" errors.
+    global _ui_script_jobs
+    for job_id in _ui_script_jobs:
+        if cmds.scriptJob(exists=job_id):
+            cmds.scriptJob(kill=job_id, force=True)
+    _ui_script_jobs = []
+
     # Clear existing children to prevent duplicate UI.  This handles
     # the case where Maya's uiScript and show() both call _build_ui,
     # or when the workspace control is restored on restart.
@@ -1735,6 +1831,15 @@ def _build_ui(parent_layout: str) -> None:
     )
 
     cmds.setParent("..")
+
+    adjust_pivot_btn = cmds.button(
+        label="Adjust Pivot Position",
+        height=28,
+        backgroundColor=UI_COLORS["warning"],
+        annotation=TOOLTIPS["adjust_pivot_btn"]
+    )
+
+    cmds.separator(height=4, style="none")
 
     delete_btn = cmds.button(
         label="Delete Pivot Rig",
@@ -2142,6 +2247,18 @@ def _build_ui(parent_layout: str) -> None:
         else:
             log_message("No active pivot rig found.", "warning")
 
+    def on_adjust_pivot(*args):
+        ctx_type, ctx_node = get_current_context()
+        if ctx_type == "rig":
+            success, msg = adjust_pivot(ctx_node)
+            log_message(msg, "success" if success else "error")
+            refresh_rig_list()
+            update_status()
+        elif ctx_type == "pending":
+            log_message("Rig is still in Stage 1. Move the pivot directly, then Complete Setup.", "warning")
+        else:
+            log_message("No pivot rig found. Create one first.", "warning")
+
     def on_delete(*args):
         ctx_type, ctx_node = get_current_context()
         if ctx_type == "rig":
@@ -2246,6 +2363,7 @@ def _build_ui(parent_layout: str) -> None:
     cmds.button(complete_setup_btn, edit=True, command=on_complete_setup)
     cmds.button(toggle_btn, edit=True, command=on_toggle)
     cmds.button(key_btn, edit=True, command=on_key)
+    cmds.button(adjust_pivot_btn, edit=True, command=on_adjust_pivot)
     cmds.button(delete_btn, edit=True, command=on_delete)
     cmds.button(select_pivot_btn, edit=True, command=on_select_pivot)
     cmds.button(select_control_btn, edit=True, command=on_select_control)
@@ -2270,8 +2388,12 @@ def _build_ui(parent_layout: str) -> None:
         # Fallback — parent to the layout itself (may not auto-kill)
         script_parent = parent_layout
 
-    cmds.scriptJob(event=["SelectionChanged", update_status], parent=script_parent)
-    cmds.scriptJob(event=["SelectionChanged", refresh_rig_list], parent=script_parent)
+    _ui_script_jobs.append(
+        cmds.scriptJob(event=["SelectionChanged", update_status], parent=script_parent)
+    )
+    _ui_script_jobs.append(
+        cmds.scriptJob(event=["SelectionChanged", refresh_rig_list], parent=script_parent)
+    )
 
     # Initialize
 
