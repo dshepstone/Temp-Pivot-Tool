@@ -34,7 +34,7 @@ Features:
 
 Author: David Shepstone
 License: MIT
-Version: 7.0.0
+Version: 7.1.0
 
 Upgrade notes from v6:
   - null_group_1 now has zeroed rotatePivot/scalePivot (pivot offset baked into pivotOffsetGrp)
@@ -68,12 +68,37 @@ OFFSET_GRP_SUFFIX = f"_{TOOL_PREFIX}_pivotOffset"  # Offset group - stores baked
 SETTINGS_SUFFIX = f"_{TOOL_PREFIX}_settings"
 CONSTRAINT_SUFFIX = f"_{TOOL_PREFIX}_parentConstraint"
 
+# Message attribute name stored on the owner control pointing at the settings node
+MSG_ATTR_SETTINGS = "tmpPivotSettings"
+
+# All known TMP suffixes for legacy owner resolution (longest first)
+_ALL_TMP_SUFFIXES = [
+    CONSTRAINT_SUFFIX,       # _TMP_parentConstraint
+    OFFSET_GRP_SUFFIX,       # _TMP_pivotOffset
+    f"{NULL_GRP_1_SUFFIX}_ringX",
+    f"{NULL_GRP_1_SUFFIX}_ringY",
+    f"{NULL_GRP_1_SUFFIX}_ringZ",
+    f"{NULL_GRP_1_SUFFIX}_loc",
+    SETTINGS_SUFFIX,         # _TMP_settings
+    NULL_GRP_2_SUFFIX,       # _TMP_anchor
+    NULL_GRP_1_SUFFIX,       # _TMP_pivot
+]
+
 # Auto-key scriptJob storage (keyed by settings node name)
 _auto_key_jobs: Dict[str, List[int]] = {}
 
 # Undo guard - prevents auto-key from firing during undo/redo
 _is_undoing: bool = False
 _undo_guard_jobs: List[int] = []
+
+# Debug logging — set to True for verbose output in the Script Editor
+TMP_PIVOT_DEBUG = False
+
+
+def _debug_log(msg: str) -> None:
+    """Print a debug message if TMP_PIVOT_DEBUG is enabled."""
+    if TMP_PIVOT_DEBUG:
+        print(f"[TMP_PIVOT_DEBUG] {msg}")
 
 # UI Colors
 UI_COLORS = {
@@ -205,6 +230,204 @@ def _resolve_transform(node: str) -> str:
             return parents[0]
 
     return node
+
+
+def _is_tmp_node(node: str) -> bool:
+    """Return True if *node* belongs to a TMP pivot rig (by name convention)."""
+    short = node.split("|")[-1]
+    return f"_{TOOL_PREFIX}_" in short
+
+
+def _find_settings_for_node(node: str) -> Optional[str]:
+    """Find the TMP settings node associated with *any* node (TMP or control).
+
+    Resolution order:
+    1. If *node* itself is a settings node, return it.
+    2. If *node* has ``targetControl`` attr (it's a pivot null), derive settings.
+    3. Walk parent hierarchy looking for settings node or targetControl attr.
+    4. Message attribute on the owner (``tmpPivotSettings``).
+    5. Suffix-strip the name to guess the settings node.
+    6. Scan all settings nodes in the scene for a matching rig member.
+    """
+    if not node or not cmds.objExists(node):
+        return None
+
+    node = _resolve_transform(node)
+    short_name = node.split("|")[-1]
+
+    # 1. Node IS the settings node
+    if short_name.endswith(SETTINGS_SUFFIX):
+        _debug_log(f"_find_settings_for_node: '{node}' is a settings node")
+        return node
+
+    # 2. Node has targetControl (pivot null or anchor)
+    if cmds.attributeQuery("targetControl", node=node, exists=True):
+        target = cmds.getAttr(f"{node}.targetControl") or ""
+        if target:
+            prefix = _sanitize_name(target)
+            candidate = f"{prefix}{SETTINGS_SUFFIX}"
+            resolved = _resolve_stored_name(candidate)
+            if resolved:
+                _debug_log(f"_find_settings_for_node: via targetControl → '{resolved}'")
+                return resolved
+
+    # 3. Walk parent hierarchy
+    current = node
+    for _ in range(10):
+        parents = cmds.listRelatives(current, parent=True, fullPath=True) or []
+        if not parents:
+            break
+        current = parents[0]
+        current_short = current.split("|")[-1]
+        if current_short.endswith(SETTINGS_SUFFIX):
+            _debug_log(f"_find_settings_for_node: parent walk found '{current}'")
+            return current
+        if cmds.attributeQuery("targetControl", node=current, exists=True):
+            target = cmds.getAttr(f"{current}.targetControl") or ""
+            if target:
+                prefix = _sanitize_name(target)
+                candidate = f"{prefix}{SETTINGS_SUFFIX}"
+                resolved = _resolve_stored_name(candidate)
+                if resolved:
+                    _debug_log(f"_find_settings_for_node: parent targetControl → '{resolved}'")
+                    return resolved
+        # Check siblings for settings node
+        children = cmds.listRelatives(current, children=True, type="transform") or []
+        for child in children:
+            if child.endswith(SETTINGS_SUFFIX):
+                _debug_log(f"_find_settings_for_node: sibling settings → '{child}'")
+                return child
+
+    # 4. Message attribute on owner
+    owner = _resolve_owner_name_only(node)
+    if owner and cmds.objExists(owner):
+        if cmds.attributeQuery(MSG_ATTR_SETTINGS, node=owner, exists=True):
+            connections = cmds.listConnections(
+                f"{owner}.{MSG_ATTR_SETTINGS}", source=True, destination=False
+            ) or []
+            for conn in connections:
+                if cmds.objExists(conn):
+                    _debug_log(f"_find_settings_for_node: message attr → '{conn}'")
+                    return conn
+
+    # 5. Suffix-strip to guess settings name
+    candidate_prefix = short_name
+    for suffix in _ALL_TMP_SUFFIXES:
+        if candidate_prefix.endswith(suffix):
+            candidate_prefix = candidate_prefix[: -len(suffix)]
+            break
+    if candidate_prefix != short_name:
+        possible = f"{candidate_prefix}{SETTINGS_SUFFIX}"
+        resolved = _resolve_stored_name(possible)
+        if resolved:
+            _debug_log(f"_find_settings_for_node: suffix-strip → '{resolved}'")
+            return resolved
+
+    # 6. Control lookup — maybe *node* is the owner control itself
+    settings = get_rig_for_control(node)
+    if settings:
+        return settings
+    short_only = node.split("|")[-1]
+    if short_only != node:
+        settings = get_rig_for_control(short_only)
+        if settings:
+            return settings
+
+    _debug_log(f"_find_settings_for_node: no settings found for '{node}'")
+    return None
+
+
+def _resolve_owner_name_only(node: str) -> Optional[str]:
+    """Best-effort owner name derivation using only naming convention (no scene queries).
+
+    This is a lightweight helper used by ``_find_settings_for_node`` to avoid
+    infinite recursion (it does NOT call ``_find_settings_for_node``).
+    """
+    short = node.split("|")[-1]
+    for suffix in _ALL_TMP_SUFFIXES:
+        if short.endswith(suffix):
+            candidate = short[: -len(suffix)]
+            if candidate:
+                return candidate
+    return None
+
+
+def _resolve_owner(node: str) -> Optional[str]:
+    """Resolve any node (TMP, shape, or control) to the real owner control.
+
+    Handles:
+    - Shape nodes → parent transform first.
+    - Settings nodes → read targetControl.
+    - Any TMP hierarchy node → walk up / suffix-strip to find owner.
+    - Controls → returned as-is if they exist.
+    - Namespaced / referenced nodes.
+
+    Returns the owner control name or ``None``.
+    """
+    if not node or not cmds.objExists(node):
+        _debug_log(f"_resolve_owner: '{node}' does not exist")
+        return None
+
+    node = _resolve_transform(node)
+    short_name = node.split("|")[-1]
+
+    # Fast path: node is not a TMP node at all — it's likely the owner itself
+    if not _is_tmp_node(node):
+        _debug_log(f"_resolve_owner: '{node}' is not a TMP node → treating as owner")
+        return node
+
+    # --- TMP node path ---
+
+    # A. Check if node has targetControl directly
+    if cmds.attributeQuery("targetControl", node=node, exists=True):
+        owner = cmds.getAttr(f"{node}.targetControl") or ""
+        if owner and cmds.objExists(owner):
+            _debug_log(f"_resolve_owner: targetControl on node → '{owner}'")
+            return owner
+
+    # B. Walk up parent hierarchy for targetControl
+    current = node
+    for _ in range(10):
+        parents = cmds.listRelatives(current, parent=True, fullPath=True) or []
+        if not parents:
+            break
+        current = parents[0]
+        if cmds.attributeQuery("targetControl", node=current, exists=True):
+            owner = cmds.getAttr(f"{current}.targetControl") or ""
+            if owner and cmds.objExists(owner):
+                _debug_log(f"_resolve_owner: parent walk targetControl → '{owner}'")
+                return owner
+
+    # C. Find the settings node and read targetControl from it
+    settings = _find_settings_for_node(node)
+    if settings and cmds.objExists(settings):
+        if cmds.attributeQuery("targetControl", node=settings, exists=True):
+            owner = cmds.getAttr(f"{settings}.targetControl") or ""
+            if owner and cmds.objExists(owner):
+                _debug_log(f"_resolve_owner: via settings '{settings}' → '{owner}'")
+                return owner
+
+    # D. Legacy fallback: strip known suffixes
+    candidate = short_name
+    for suffix in _ALL_TMP_SUFFIXES:
+        if candidate.endswith(suffix):
+            candidate = candidate[: -len(suffix)]
+            break
+    if candidate and candidate != short_name:
+        if cmds.objExists(candidate):
+            _debug_log(f"_resolve_owner: suffix-strip → '{candidate}'")
+            return candidate
+        # Try with wildcard namespace search
+        matches = cmds.ls(f"*:{candidate}", type="transform") or []
+        if len(matches) == 1:
+            _debug_log(f"_resolve_owner: namespace search → '{matches[0]}'")
+            return matches[0]
+        if matches:
+            _debug_log(f"_resolve_owner: ambiguous namespace, using first → '{matches[0]}'")
+            return matches[0]
+
+    _debug_log(f"_resolve_owner: could not resolve owner for '{node}'")
+    return None
 
 
 def _align_to_target_world_matrix(object_to_align: str, target: str) -> None:
@@ -429,7 +652,25 @@ def get_all_pivot_rigs() -> List[str]:
 
 
 def get_rig_for_control(control: str) -> Optional[str]:
-    """Find the settings node for a given control, if one exists."""
+    """Find the settings node for a given control, if one exists.
+
+    Checks the message attribute ``tmpPivotSettings`` first for O(1) lookup,
+    then falls back to scanning all settings nodes (legacy scenes).
+    """
+    if not control or not cmds.objExists(control):
+        return None
+
+    # Fast path: message attribute on the owner
+    if cmds.attributeQuery(MSG_ATTR_SETTINGS, node=control, exists=True):
+        connections = cmds.listConnections(
+            f"{control}.{MSG_ATTR_SETTINGS}", source=True, destination=False
+        ) or []
+        for conn in connections:
+            if cmds.objExists(conn):
+                _debug_log(f"get_rig_for_control: message attr → '{conn}'")
+                return conn
+
+    # Fallback: scan all settings nodes
     settings_nodes = get_all_pivot_rigs()
     for settings in settings_nodes:
         if cmds.attributeQuery("targetControl", node=settings, exists=True):
@@ -558,6 +799,13 @@ def create_pivot_locator(control: str) -> Tuple[bool, str, Optional[str]]:
     # Ensure it's a transform node
     if cmds.nodeType(control) != "transform":
         return False, f"'{control}' is not a transform node.", None
+
+    # Guard: reject TMP nodes to prevent "pivot-of-pivot"
+    if _is_tmp_node(control):
+        owner = _resolve_owner(control)
+        owner_msg = f" (owner: '{owner}')" if owner else ""
+        _debug_log(f"create_pivot_locator: rejected TMP node '{control}'{owner_msg}")
+        return False, f"'{control}' is a TMP rig node, not a control{owner_msg}. Select the original control instead.", None
 
     cmds.undoInfo(openChunk=True, chunkName="TMP_CreatePivotLocator")
     try:
@@ -752,6 +1000,23 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         cmds.parent(settings_node, offset_grp)
         # Re-resolve settings_node after reparenting (DAG path changed)
         settings_node = _resolve_stored_name(settings_node.split("|")[-1])
+
+        # ------------------------------------------------------------------
+        # Deterministic tracking: message attribute on owner → settings node
+        # ------------------------------------------------------------------
+        if not cmds.attributeQuery(MSG_ATTR_SETTINGS, node=control, exists=True):
+            cmds.addAttr(control, longName=MSG_ATTR_SETTINGS, attributeType="message")
+        # Disconnect any stale connection first
+        existing_conns = cmds.listConnections(
+            f"{control}.{MSG_ATTR_SETTINGS}", source=True, destination=False, plugs=True
+        ) or []
+        for plug in existing_conns:
+            try:
+                cmds.disconnectAttr(plug, f"{control}.{MSG_ATTR_SETTINGS}")
+            except RuntimeError:
+                pass
+        cmds.connectAttr(f"{settings_node}.message", f"{control}.{MSG_ATTR_SETTINGS}", force=True)
+        _debug_log(f"complete_setup: connected {settings_node}.message → {control}.{MSG_ATTR_SETTINGS}")
 
         # Mark null_grp_1 setup as complete
         cmds.setAttr(f"{null_grp_1}.setupComplete", True)
@@ -1145,47 +1410,77 @@ def cleanup_auto_key(settings_node: str) -> None:
 # =============================================================================
 
 def delete_pivot_rig(settings_node: str) -> Tuple[bool, str]:
-    """Delete the pivot rig completely."""
+    """Delete the pivot rig completely.
+
+    Idempotent — safe to call even if some rig nodes are already gone.
+    Handles referenced nodes gracefully (warns instead of erroring).
+    Cleans up the message attribute on the owner control.
+    """
     if not cmds.objExists(settings_node):
         return False, "Settings node not found."
 
     nodes = get_rig_nodes(settings_node)
     control = nodes["control"]
+    _debug_log(f"delete_pivot_rig: settings='{settings_node}', control='{control}'")
 
     cmds.undoInfo(openChunk=True, chunkName="TMP_DeletePivotRig")
     try:
         # Clean up auto-key scriptJobs (in case they exist)
         cleanup_auto_key(settings_node)
 
-        # Toggle off first
+        # Toggle off first (deletes constraint)
         if is_rig_active(settings_node):
             toggle_off(settings_node)
 
+        # Helper to delete a node safely (handles referenced / locked nodes)
+        def _safe_delete(node_name: str) -> None:
+            if not node_name or not cmds.objExists(node_name):
+                return
+            try:
+                if cmds.referenceQuery(node_name, isNodeReferenced=True):
+                    _debug_log(f"delete_pivot_rig: '{node_name}' is referenced, skipping delete")
+                    cmds.warning(f"Cannot delete referenced node '{node_name}'. Remove the reference first.")
+                    return
+            except RuntimeError:
+                pass  # not referenced
+            try:
+                cmds.delete(node_name)
+                _debug_log(f"delete_pivot_rig: deleted '{node_name}'")
+            except RuntimeError as exc:
+                cmds.warning(f"Could not delete '{node_name}': {exc}")
+
+        # Re-query nodes after toggle_off (DAG paths may have changed)
+        nodes = get_rig_nodes(settings_node) if cmds.objExists(settings_node) else nodes
+
         # Delete null_group_2 (which parents everything else in v7)
-        null_grp_2 = nodes["null_grp_2"]
-        if null_grp_2 and cmds.objExists(null_grp_2):
-            cmds.delete(null_grp_2)
+        _safe_delete(nodes.get("null_grp_2"))
 
         # Delete offset group if it wasn't parented under null_group_2
-        offset_grp = nodes["pivot_offset_grp"]
-        if offset_grp and cmds.objExists(offset_grp):
-            cmds.delete(offset_grp)
+        _safe_delete(nodes.get("pivot_offset_grp"))
 
         # Delete null_group_1 if it wasn't parented under null_group_2 or offset_grp
-        null_grp_1 = nodes["null_grp_1"]
-        if null_grp_1 and cmds.objExists(null_grp_1):
-            cmds.delete(null_grp_1)
+        _safe_delete(nodes.get("null_grp_1"))
 
         # Clean up orphaned settings node
-        if cmds.objExists(settings_node):
-            cmds.delete(settings_node)
+        _safe_delete(settings_node)
 
-        # Remove any remaining constraints
+        # Remove any remaining TMP constraints on the control
         if control and cmds.objExists(control):
             constraints = cmds.listRelatives(control, type="parentConstraint") or []
             for c in constraints:
                 if CONSTRAINT_SUFFIX in c or TOOL_PREFIX in c:
-                    cmds.delete(c)
+                    _safe_delete(c)
+
+        # ------------------------------------------------------------------
+        # Clean up message attribute on owner
+        # ------------------------------------------------------------------
+        if control and cmds.objExists(control):
+            if cmds.attributeQuery(MSG_ATTR_SETTINGS, node=control, exists=True):
+                try:
+                    cmds.deleteAttr(f"{control}.{MSG_ATTR_SETTINGS}")
+                    _debug_log(f"delete_pivot_rig: removed {MSG_ATTR_SETTINGS} from '{control}'")
+                except RuntimeError:
+                    pass  # may be locked / referenced
 
         return True, f"Deleted pivot rig for '{control}'."
     finally:
@@ -1604,49 +1899,43 @@ def _build_ui(parent_layout: str) -> None:
         pending_pivot = None
 
         for item in sel:
-            # Use short name for suffix checks
-            short_name = item.split("|")[-1]
+            # --- TMP node: use robust resolution ---
+            if _is_tmp_node(item):
+                short_name = item.split("|")[-1]
+                # Check for pending pivot (Stage 1)
+                if short_name.endswith(NULL_GRP_1_SUFFIX):
+                    if cmds.attributeQuery("setupComplete", node=item, exists=True):
+                        if not cmds.getAttr(f"{item}.setupComplete"):
+                            pending_pivot = item
+                            break
+                # Find settings via robust helper
+                settings = _find_settings_for_node(item)
+                if settings and cmds.objExists(settings):
+                    selected_settings = settings
+                    break
+                # Last resort: resolve owner
+                owner = _resolve_owner(item)
+                if owner:
+                    rig = get_rig_for_control(owner)
+                    if rig:
+                        selected_settings = rig
+                        break
+                continue
 
-            # Check for null_grp_1 (pivot)
-            if NULL_GRP_1_SUFFIX in short_name:
-                # Check if it's pending or complete
-                if cmds.attributeQuery("setupComplete", node=item, exists=True):
-                    if cmds.getAttr(f"{item}.setupComplete"):
-                        # Complete - find settings
-                        prefix = short_name.replace(NULL_GRP_1_SUFFIX, "")
-                        possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                        if cmds.objExists(possible_settings):
-                            selected_settings = possible_settings
-                    else:
-                        pending_pivot = item
-                break
-            # Check for null_grp_2 (anchor)
-            if NULL_GRP_2_SUFFIX in short_name:
-                prefix = short_name.replace(NULL_GRP_2_SUFFIX, "")
-                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                if cmds.objExists(possible_settings):
-                    selected_settings = possible_settings
-                break
-            # Check for offset group
-            if OFFSET_GRP_SUFFIX in short_name:
-                prefix = short_name.replace(OFFSET_GRP_SUFFIX, "")
-                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                if cmds.objExists(possible_settings):
-                    selected_settings = possible_settings
-                break
-            # Check if control
+            # --- Normal control ---
             rig = get_rig_for_control(item)
             if rig:
                 selected_settings = rig
                 break
-            # Also try short name for rig lookup
             short = item.split("|")[-1]
-            rig = get_rig_for_control(short)
-            if rig:
-                selected_settings = rig
-                break
-            # Check for pending pivot
+            if short != item:
+                rig = get_rig_for_control(short)
+                if rig:
+                    selected_settings = rig
+                    break
             pending = get_pending_pivot_for_control(item)
+            if not pending and short != item:
+                pending = get_pending_pivot_for_control(short)
             if pending:
                 pending_pivot = pending
 
@@ -1674,42 +1963,62 @@ def _build_ui(parent_layout: str) -> None:
             cmds.button(state_indicator, edit=True, label="READY", backgroundColor=UI_COLORS["off_state"])
 
     def get_current_context():
-        """Get current rig settings or pending pivot."""
+        """Get current rig settings or pending pivot.
+
+        Uses ``_resolve_owner`` / ``_find_settings_for_node`` so that
+        selecting *any* TMP rig node (pivot, anchor, offset, settings,
+        ring shape, locator shape, etc.) correctly resolves to the
+        owning control's rig — preventing "pivot-of-pivot" creation and
+        ensuring toggle/delete always targets the right rig.
+        """
         sel = _resolve_selection()
 
         for item in sel:
-            short_name = item.split("|")[-1]
+            # ----------------------------------------------------------
+            # 1. If this IS a TMP node, resolve via robust helpers
+            # ----------------------------------------------------------
+            if _is_tmp_node(item):
+                # Check for pending (Stage 1) pivot null first
+                short_name = item.split("|")[-1]
+                if short_name.endswith(NULL_GRP_1_SUFFIX):
+                    if cmds.attributeQuery("setupComplete", node=item, exists=True):
+                        if not cmds.getAttr(f"{item}.setupComplete"):
+                            _debug_log(f"get_current_context: pending pivot '{item}'")
+                            return ("pending", item)
 
-            if NULL_GRP_1_SUFFIX in short_name:
-                if cmds.attributeQuery("setupComplete", node=item, exists=True):
-                    if cmds.getAttr(f"{item}.setupComplete"):
-                        prefix = short_name.replace(NULL_GRP_1_SUFFIX, "")
-                        possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                        if cmds.objExists(possible_settings):
-                            return ("rig", possible_settings)
-                    else:
-                        return ("pending", item)
-            if NULL_GRP_2_SUFFIX in short_name:
-                prefix = short_name.replace(NULL_GRP_2_SUFFIX, "")
-                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                if cmds.objExists(possible_settings):
-                    return ("rig", possible_settings)
-            if OFFSET_GRP_SUFFIX in short_name:
-                prefix = short_name.replace(OFFSET_GRP_SUFFIX, "")
-                possible_settings = f"{prefix}{SETTINGS_SUFFIX}"
-                if cmds.objExists(possible_settings):
-                    return ("rig", possible_settings)
+                # Find the settings node for this TMP hierarchy
+                settings = _find_settings_for_node(item)
+                if settings and cmds.objExists(settings):
+                    _debug_log(f"get_current_context: TMP node '{item}' → settings '{settings}'")
+                    return ("rig", settings)
 
+                # Last resort: resolve owner and look up their rig
+                owner = _resolve_owner(item)
+                if owner:
+                    rig = get_rig_for_control(owner)
+                    if rig:
+                        _debug_log(f"get_current_context: owner '{owner}' → rig '{rig}'")
+                        return ("rig", rig)
+
+                _debug_log(f"get_current_context: TMP node '{item}' could not be resolved")
+                continue
+
+            # ----------------------------------------------------------
+            # 2. Normal control — look up rig or pending pivot
+            # ----------------------------------------------------------
             rig = get_rig_for_control(item)
             if rig:
                 return ("rig", rig)
             # Try short name
             short = item.split("|")[-1]
-            rig = get_rig_for_control(short)
-            if rig:
-                return ("rig", rig)
+            if short != item:
+                rig = get_rig_for_control(short)
+                if rig:
+                    return ("rig", rig)
 
             pending = get_pending_pivot_for_control(item)
+            if not pending and short != item:
+                pending = get_pending_pivot_for_control(short)
             if pending:
                 return ("pending", pending)
 
@@ -1722,10 +2031,22 @@ def _build_ui(parent_layout: str) -> None:
         cmds.refresh(force=True)
 
         sel = _resolve_selection()
-        controls = [s for s in sel if TOOL_PREFIX not in s.split("|")[-1]]
+
+        # Resolve selection: if any item is a TMP node, resolve to its owner
+        controls = []
+        for s in sel:
+            if _is_tmp_node(s):
+                owner = _resolve_owner(s)
+                if owner and not _is_tmp_node(owner):
+                    _debug_log(f"on_create_pivot: resolved TMP '{s}' → owner '{owner}'")
+                    controls.append(owner)
+                else:
+                    _debug_log(f"on_create_pivot: skipping unresolvable TMP node '{s}'")
+            else:
+                controls.append(s)
 
         if not controls:
-            log_message("Select a control first.", "warning")
+            log_message("Select a control first (not a TMP rig node).", "warning")
             return
 
         # Use short name for the control (strip DAG path)
