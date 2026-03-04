@@ -1028,46 +1028,23 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
         # 2. Read null_grp_1's current world matrix (its position at control)
         null_grp_1_world_matrix = cmds.xform(null_grp_1, q=True, ws=True, m=True)
 
-        # 3. Create null_grp_2 (POSITION ANCHOR) aligned to control.
-        #    This anchor holds the pivot rig relative to the control and is
-        #    required for both translation and rotation to work via the
-        #    parent constraint.  Without it, pivotOffsetGrp sits in world
-        #    space and the constraint's translation component fails.
-        null_grp_2 = _create_visual_null(
-            f"{prefix}{NULL_GRP_2_SUFFIX}",
-            UI_COLORS["stage2"],  # Blue for anchor
-            size=1.2  # Slightly larger to distinguish
-        )
-        _align_translate_rotate(null_grp_2, control)
-        cmds.xform(null_grp_2, ws=False, s=[1, 1, 1])
-        # Hide anchor shapes — only the pivot control should be visible
-        _set_shapes_visibility(null_grp_2, False)
+        # ---- Phase A: Build offset_grp → null_grp_1 at WORLD level ----
+        # This matches the original working hierarchy.  offset_grp is
+        # positioned at the pivot point with the control's rotation, and
+        # null_grp_1 is parented under it with zeroed transforms/pivots.
 
-        # 4. Create pivotOffsetGrp directly under null_grp_2 and position
-        #    it at the pivot point.  We parent FIRST then position, so that
-        #    offset_grp's local rotation stays at exactly [0,0,0] — matching
-        #    the state that toggle_on expects.  Setting world-space rotation
-        #    before parenting can introduce floating-point drift in the local
-        #    rotation decomposition which breaks the constraint's rotation.
+        # 3. Create the pivotOffsetGrp at the world-space pivot point
         offset_grp = cmds.group(
             empty=True,
             name=f"{prefix}{OFFSET_GRP_SUFFIX}"
         )
-        cmds.parent(offset_grp, null_grp_2)
-        offset_grp = _resolve_stored_name(offset_grp.split("|")[-1])
-
-        # Explicitly zero local rotation so offset_grp inherits null_grp_2's
-        # rotation (same as how the toggle cycle leaves it).
-        for attr in ["rx", "ry", "rz"]:
-            cmds.setAttr(f"{offset_grp}.{attr}", 0)
-
-        # 5. Position pivotOffsetGrp at the world-space pivot point.
-        #    Maya computes the local translate needed to reach this world
-        #    position given the parent's transform.
         cmds.xform(offset_grp, ws=True, t=pivot_ws)
+        # Match the control's rotation so the local-space offset axes
+        # align with the control's orientation.
+        null_rot = cmds.xform(null_grp_1, q=True, ws=True, ro=True)
+        cmds.xform(offset_grp, ws=True, ro=null_rot)
 
-        # 6. Parent null_grp_1 under offset_grp, then zero its transforms.
-        #    This mirrors toggle_on's sequence exactly.
+        # 4. Parent null_grp_1 under offset_grp
         cmds.parent(null_grp_1, offset_grp)
         # Re-resolve null_grp_1's name after reparenting (DAG path changed)
         children = cmds.listRelatives(offset_grp, children=True, type="transform", fullPath=True) or []
@@ -1077,8 +1054,39 @@ def complete_setup(null_grp_1: str) -> Tuple[bool, str, Optional[str]]:
                 null_grp_1 = child
                 break
 
-        # 7. Zero out null_grp_1's local transforms and pivots.
-        #    The offset is now stored in pivotOffsetGrp's local translate.
+        # 5. Zero null_grp_1's local transforms and pivots
+        for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
+            _safe_set_attr(null_grp_1, attr, 0)
+
+        # ---- Phase B: Add null_grp_2 anchor (same as toggle_off) ----
+        # This is the EXACT sequence that toggle_off uses to wrap the
+        # existing offset_grp hierarchy under a position anchor.  By
+        # replicating toggle_off's order of operations, we guarantee the
+        # local transforms that Maya computes during cmds.parent() are
+        # identical to what toggle_on later expects.
+
+        # 6. Create null_grp_2 (POSITION ANCHOR) aligned to control
+        null_grp_2 = _create_visual_null(
+            f"{prefix}{NULL_GRP_2_SUFFIX}",
+            UI_COLORS["stage2"],  # Blue for anchor
+            size=1.2  # Slightly larger to distinguish
+        )
+        _align_translate_rotate(null_grp_2, control)
+        cmds.xform(null_grp_2, ws=False, s=[1, 1, 1])
+        _set_shapes_visibility(null_grp_2, False)
+
+        # 7. Parent offset_grp under null_grp_2 — Maya preserves
+        #    offset_grp's world position and computes the correct local
+        #    transforms in one atomic operation (same as toggle_off).
+        cmds.parent(offset_grp, null_grp_2)
+        offset_grp = _resolve_stored_name(offset_grp.split("|")[-1])
+        null_grp_1 = _resolve_stored_name(null_grp_1.split("|")[-1])
+
+        # ---- Phase C: Activate (same as toggle_on) ----
+        # Re-zero null_grp_1 local transforms after reparenting, then
+        # create the constraint — exactly matching toggle_on's logic.
+
+        # 8. Zero null_grp_1 local transforms (toggle_on step)
         for attr in ["tx", "ty", "tz", "rx", "ry", "rz"]:
             _safe_set_attr(null_grp_1, attr, 0)
 
