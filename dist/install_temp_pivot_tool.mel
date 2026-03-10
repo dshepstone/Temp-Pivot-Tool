@@ -1,0 +1,313 @@
+// ============================================================================
+// Temp Pivot Tool - Maya Installer
+// ============================================================================
+//
+// Drag and drop this file into Maya to install the Temp Pivot Tool.
+//
+// TWO-STAGE SETUP PROCESS:
+//   Stage 1: Create locator_1 (pivot) - user moves this to desired pivot location
+//   Stage 2: Complete setup - creates locator_2 (driver), null_GRP, parenting, constraint
+//
+// Hierarchy Structure:
+//   null_GRP (anchor - at control position)
+//     └ locator_1 (PIVOT - user positioned this in Stage 1)
+//         └ locator_2 (DRIVER - at control position, constrains control)
+//
+// Workflow:
+//   1. Select control, click "Create Pivot Locator" (Stage 1)
+//   2. Move locator_1 to where you want the pivot point
+//   3. Click "Complete Setup" (Stage 2)
+//   4. Rotate locator_1 - control orbits around the pivot
+//   5. Key control when satisfied
+//   6. Toggle OFF - constraint deleted, rig hidden
+//   7. Toggle ON - rig realigns to control, constraint recreated
+//
+// Author: David Shepstone
+// License: MIT
+// Version: 5.0.0
+// ============================================================================
+
+global string $tempPivotToolVersion = "5.0.0";
+
+// ----------------------------------------------------------------------------
+// Get the directory where this installer script is located
+// ----------------------------------------------------------------------------
+global proc string tempPivotInstall_GetScriptDir()
+{
+    string $info = `whatIs "tempPivotInstall_GetScriptDir"`;
+    string $path = "";
+
+    if (`gmatch $info "Mel procedure found in: *"`)
+    {
+        $path = substituteAllString($info, "Mel procedure found in: ", "");
+    }
+    else if (`gmatch $info "Script found in: *"`)
+    {
+        $path = substituteAllString($info, "Script found in: ", "");
+    }
+
+    $path = substituteAllString($path, "\\", "/");
+
+    if ($path == "")
+    {
+        error "Temp Pivot Tool installer: Unable to locate installer directory.";
+    }
+
+    return `dirname $path`;
+}
+
+// ----------------------------------------------------------------------------
+// Copy a file from source to destination with error handling
+// ----------------------------------------------------------------------------
+global proc int tempPivot_DoCopy(string $source, string $destination)
+{
+    string $cleanSource = substituteAllString($source, "\\", "/");
+    string $cleanDest = substituteAllString($destination, "\\", "/");
+
+    if (!`filetest -f $cleanSource`)
+    {
+        warning ("Temp Pivot Tool installer: Source file not found: " + $cleanSource);
+        return 0;
+    }
+
+    string $destDir = `dirname $cleanDest`;
+    if (!`filetest -d $destDir`)
+    {
+        print ("Creating directory: " + $destDir + "\n");
+        sysFile -makeDir $destDir;
+    }
+
+    int $result = `sysFile -copy $cleanDest $cleanSource`;
+
+    if (!$result)
+    {
+        warning ("Temp Pivot Tool installer: Failed to copy file.\n  From: " + $cleanSource + "\n  To: " + $cleanDest);
+        return 0;
+    }
+
+    print ("  Copied: " + `basenameEx $cleanSource` + "\n");
+    return 1;
+}
+
+// ----------------------------------------------------------------------------
+// Create the shelf button for the tool
+// ----------------------------------------------------------------------------
+global proc tempPivotInstall_CreateShelfButton(string $iconName)
+{
+    global string $gShelfTopLevel;
+
+    if (!`tabLayout -exists $gShelfTopLevel`)
+    {
+        warning "Temp Pivot Tool installer: Unable to locate shelf layout.";
+        return;
+    }
+
+    string $currentShelf = `tabLayout -q -selectTab $gShelfTopLevel`;
+
+    if ($currentShelf == "")
+    {
+        warning "Temp Pivot Tool installer: Unable to locate current shelf.";
+        return;
+    }
+
+    string $existingButtons[] = `shelfLayout -q -childArray $currentShelf`;
+    for ($btn in $existingButtons)
+    {
+        if (`shelfButton -q -exists $btn`)
+        {
+            string $label = `shelfButton -q -label $btn`;
+            if ($label == "Temp Pivot")
+            {
+                deleteUI $btn;
+                print ("  Removed existing shelf button.\n");
+            }
+        }
+    }
+
+    shelfButton
+        -parent $currentShelf
+        -label "Temp Pivot"
+        -annotation "Temp Pivot Tool - Create temporary rotation pivots for animation"
+        -image $iconName
+        -image1 $iconName
+        -sourceType "python"
+        -command "import temp_pivot_tool\ntemp_pivot_tool.show()"
+        -doubleClickCommand "import temp_pivot_tool\nimport importlib\nimportlib.reload(temp_pivot_tool)\ntemp_pivot_tool.show()";
+
+    print ("  Created shelf button on: " + $currentShelf + "\n");
+}
+
+// ----------------------------------------------------------------------------
+// Remove old installation files if they exist
+// ----------------------------------------------------------------------------
+global proc tempPivot_CleanOldInstall()
+{
+    string $userScripts = substituteAllString(`internalVar -userScriptDir`, "\\", "/");
+    string $oldFile = $userScripts + "temp_pivot_tool.py";
+
+    if (`filetest -f $oldFile`)
+    {
+        print ("  Updating existing installation...\n");
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Main installation procedure
+// ----------------------------------------------------------------------------
+global proc tempPivot_Install()
+{
+    global string $gShelfTopLevel;
+    global string $tempPivotToolVersion;
+
+    print "\n";
+    print "============================================================\n";
+    print ("  Temp Pivot Tool Installer v" + $tempPivotToolVersion + "\n");
+    print "============================================================\n";
+    print "\n";
+
+    string $baseDir = tempPivotInstall_GetScriptDir();
+    $baseDir = substituteAllString($baseDir, "\\", "/");
+
+    print ("Source directory: " + $baseDir + "\n\n");
+
+    string $pyFile = "temp_pivot_tool.py";
+    string $iconFile = "temp-pivot.png";
+
+    string $srcPy = ($baseDir + "/" + $pyFile);
+    string $srcIcon = ($baseDir + "/" + $iconFile);
+
+    string $userScripts = substituteAllString(`internalVar -userScriptDir`, "\\", "/");
+    string $userIcons = substituteAllString(`internalVar -userBitmapsDir`, "\\", "/");
+
+    if (!`gmatch $userScripts "*/"`)
+    {
+        $userScripts += "/";
+    }
+    if (!`gmatch $userIcons "*/"`)
+    {
+        $userIcons += "/";
+    }
+
+    string $destPy = ($userScripts + $pyFile);
+    string $destIcon = ($userIcons + $iconFile);
+
+    print "Installing files:\n";
+
+    tempPivot_CleanOldInstall();
+
+    int $pySuccess = tempPivot_DoCopy($srcPy, $destPy);
+    int $iconSuccess = tempPivot_DoCopy($srcIcon, $destIcon);
+
+    if (!$pySuccess)
+    {
+        error "Temp Pivot Tool installation failed: Could not copy Python script.";
+        return;
+    }
+
+    print "\nCreating shelf button:\n";
+
+    tempPivotInstall_CreateShelfButton($iconFile);
+
+    print "\n";
+    print "============================================================\n";
+    print "  Installation Complete!\n";
+    print "============================================================\n";
+    print "\n";
+    print "Files installed to:\n";
+    print ("  Script: " + $destPy + "\n");
+    print ("  Icon:   " + $destIcon + "\n");
+    print "\n";
+    print "Usage:\n";
+    print "  - Click the 'Temp Pivot' button on your shelf\n";
+    print "  - Or run: import temp_pivot_tool; temp_pivot_tool.show()\n";
+    print "\n";
+    print "TWO-STAGE WORKFLOW:\n";
+    print "\n";
+    print "  STAGE 1: Create Pivot Locator\n";
+    print "    1. Select a control (e.g., IK foot)\n";
+    print "    2. Click 'Create Pivot Locator'\n";
+    print "    3. Move locator_1 to desired pivot point\n";
+    print "\n";
+    print "  STAGE 2: Complete Setup\n";
+    print "    4. Click 'Complete Setup'\n";
+    print "    5. Rotate locator_1 - control orbits around pivot\n";
+    print "    6. Click 'Key Control' to set keyframe\n";
+    print "    7. Click 'Toggle OFF' when done\n";
+    print "\n";
+    print "  REPEAT:\n";
+    print "    8. Move control to new position\n";
+    print "    9. Click 'Toggle ON' - rig realigns\n";
+    print "   10. Rotate pivot, Key, Toggle OFF\n";
+    print "\n";
+    print "Hierarchy created:\n";
+    print "  null_GRP (realignment anchor)\n";
+    print "    + locator_1 (PIVOT - rotate this)\n";
+    print "        + locator_2 (DRIVER - constrains control)\n";
+    print "\n";
+
+    print "Launching Temp Pivot Tool...\n\n";
+    python("import temp_pivot_tool; temp_pivot_tool.show()");
+}
+
+// ----------------------------------------------------------------------------
+// Uninstall procedure (can be called manually if needed)
+// ----------------------------------------------------------------------------
+global proc tempPivot_Uninstall()
+{
+    global string $gShelfTopLevel;
+
+    print "\n";
+    print "Uninstalling Temp Pivot Tool...\n";
+
+    string $userScripts = substituteAllString(`internalVar -userScriptDir`, "\\", "/");
+    string $pyFile = $userScripts + "temp_pivot_tool.py";
+
+    if (`filetest -f $pyFile`)
+    {
+        sysFile -delete $pyFile;
+        print ("  Removed: " + $pyFile + "\n");
+    }
+
+    string $userIcons = substituteAllString(`internalVar -userBitmapsDir`, "\\", "/");
+    string $iconFile = $userIcons + "temp-pivot.png";
+
+    if (`filetest -f $iconFile`)
+    {
+        sysFile -delete $iconFile;
+        print ("  Removed: " + $iconFile + "\n");
+    }
+
+    if (`tabLayout -exists $gShelfTopLevel`)
+    {
+        string $shelves[] = `tabLayout -q -childArray $gShelfTopLevel`;
+        for ($shelf in $shelves)
+        {
+            string $buttons[] = `shelfLayout -q -childArray $shelf`;
+            for ($btn in $buttons)
+            {
+                if (`shelfButton -q -exists $btn`)
+                {
+                    string $label = `shelfButton -q -label $btn`;
+                    if ($label == "Temp Pivot")
+                    {
+                        deleteUI $btn;
+                        print ("  Removed shelf button from: " + $shelf + "\n");
+                    }
+                }
+            }
+        }
+    }
+
+    if (`window -exists "tempPivotToolWindow"`)
+    {
+        deleteUI "tempPivotToolWindow";
+        print ("  Closed tool window.\n");
+    }
+
+    print "\nUninstallation complete.\n\n";
+}
+
+// ----------------------------------------------------------------------------
+// Run the installer immediately when this script is sourced
+// ----------------------------------------------------------------------------
+tempPivot_Install();
